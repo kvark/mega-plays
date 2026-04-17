@@ -1,0 +1,15 @@
+[package]
+name = "mega-pong"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Pong: physics, observation / reward encoding, and egui rendering."
+
+[dependencies]
+mega-plays.workspace = true
+egui.workspace = true
+glam.workspace = true
+rand.workspace = true
