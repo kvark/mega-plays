@@ -1,0 +1,23 @@
+[package]
+name = "mega-plays"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Shared library for live-learning game demos built on Blade and Meganeura."
+
+[dependencies]
+blade-graphics.workspace = true
+blade-egui.workspace = true
+blade-macros.workspace = true
+egui.workspace = true
+egui-winit.workspace = true
+winit.workspace = true
+bytemuck.workspace = true
+log.workspace = true
+env_logger.workspace = true
+glam.workspace = true
+rand.workspace = true
+meganeura.workspace = true

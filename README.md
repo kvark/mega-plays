@@ -2,168 +2,156 @@
 
 Games where the opponents learn in real time, on your laptop's GPU, in Rust — no CUDA, no Python.
 
-A showcase for [Meganeura](https://github.com/kvark/meganeura) (GPU neural network inference and training in Rust) and [blade-graphics](https://github.com/kvark/blade). Every agent you see playing is training live: fresh-start on launch, visibly improving within a minute, converged within a few.
+Showcase for [meganeura](https://github.com/kvark/meganeura) (GPU neural
+network inference and training) and [blade-graphics](https://github.com/kvark/blade).
+Every agent you see playing is training live: fresh-start on launch,
+visibly improving within a minute, converged within a few.
 
 ## Status
 
-Early development. First game: Pong, self-play.
+Early scaffolding. The workspace builds, the pong binary opens a window,
+the agent plays against a scripted tracker, and the DQN pipeline is
+wired end-to-end through meganeura. Training convergence targets from
+the original design have not yet been measured on hardware.
 
-## Games
-
-- **Pong** *(in progress)* — classic two-paddle Pong with self-play DQN agents.
-- *(more to come)*
-
-## Why
-
-Mainstream ML tooling assumes CUDA. Meganeura doesn't. This repo is proof that a Rust/GPU ML stack targeting Metal, Vulkan, and DX12 can handle end-to-end reinforcement learning workloads — training, inference, rendering — in a single native binary, on hardware that Python pipelines tend to treat as second-class (Apple Silicon, AMD, Intel Arc).
-
-The goal isn't Pong. The goal is to make the training loop visible and compelling so the underlying stack is too.
-
----
-
-## Pong — first implementation
-
-### Design targets
-
-- **Cold start to entertaining**: two untrained self-play agents begin as soon as the binary runs. Learning must be visibly progressing within ~30 seconds.
-- **Convergence**: competent rallies within a few minutes on a typical laptop GPU (M1 / M2 / mid-range discrete).
-- **Single binary**: no runtime dependencies, no Python, no downloads. Signed binaries for macOS, Windows, Linux.
-- **Shareable**: a built-in hotkey records the last 30 seconds as GIF/MP4.
-
-### Validate before building
-
-Before committing to full Rust implementation, validate the learning-speed assumption. Prototype the Pong DQN in Python (PyTorch, ~100 lines) with the same state representation, network size, and self-play setup described below. Confirm visible policy improvement within 30 seconds and competent play within a few minutes on a laptop CPU. If it takes longer, the scope needs adjustment — smaller network, simpler dynamics, or a different starter game — before Rust implementation begins.
-
-### Game
-
-- Two paddles, one ball. Standard Pong mechanics.
-- Fixed-timestep physics at 120 Hz, rendering at 60 Hz.
-- First to 11 wins; auto-reset.
-- **Modes**: self-play (default), human-vs-AI (press `P` to take over the left paddle).
-
-Art direction: minimalist, monochrome, crisp. The visuals should read as "precise technical demo," not "skeuomorphic arcade." Paddles and ball are simple rectangles. The overlay type is clean monospace.
-
-### Learning setup
-
-- **Algorithm**: DQN with experience replay and a target network.
-- **Observation**: state-based, 6–8 floats — own paddle y, opponent paddle y, ball x/y, ball vx/vy, optionally normalized time-to-contact. Do *not* use pixels. Normalize everything to roughly [-1, 1].
-- **Action space**: discrete, 3 actions — up, down, stay.
-- **Reward**: +1 on scoring, -1 on being scored on, small optional shaping term for paddle-to-ball y-alignment (configurable; off once agents are competent).
-- **Network**: MLP, 2 hidden layers of 64–128 units, ReLU. Small on purpose.
-- **Discount**: γ = 0.99.
-- **Exploration**: ε-greedy, ε decaying from 1.0 to 0.05 over the first few minutes of wall time.
-- **Replay buffer**: ~100k transitions, uniform sampling.
-- **Target network**: hard update every ~1000 gradient steps.
-- **Optimizer**: Adam, lr ≈ 1e-3.
-- **Batch size**: 256.
-
-Hyperparameters live in `config.toml` next to the binary, with sensible defaults compiled in. Do not expose them in the UI for v1.
-
-### Self-play stability
-
-Pure self-play is non-stationary and prone to degenerate equilibria (both agents learn to stand still; one dominates and the other never sees winning states). Mitigations, in order of importance:
-
-1. **Symmetric policy**: both paddles share a single policy network. The right paddle's observation is mirrored before being fed in, and its action is mirrored after. Halves parameters and variance.
-2. **Scripted bootstrap**: for the first ~30 seconds of wall time, one of the two paddles is a scripted tracker (follows the ball with a small delay and noise). This ensures the replay buffer fills with meaningful transitions before pure self-play begins.
-3. **League sampling**: maintain a ring buffer of ~8 past policy checkpoints snapshotted at regular intervals. With probability ~0.3, one paddle's action is sampled from a historical checkpoint rather than the live policy.
-
-### Threading and data flow
-
-This is the most important architectural constraint. Getting it right once makes the demo feel instant; getting it wrong makes everything janky.
-
-- **Main thread**: game simulation, rendering, input handling, overlay. 60 Hz render / 120 Hz physics.
-- **Training thread**: drains a lock-free transition queue, runs minibatch DQN updates on the GPU via Meganeura, periodically publishes new policy weights.
-- **Weight handoff**: double-buffered. The training thread writes fresh weights into a back buffer, then atomically swaps a pointer. The main thread reads from the front buffer without locks.
-- **Inference on the main thread**: runs through Meganeura against the front-buffer weights. Must never block on training.
-
-Transition flow: main thread pushes `(obs, action, reward, next_obs, done)` into a bounded MPSC queue after every physics step. Training thread pulls, appends to replay buffer, samples, steps.
-
-### Visualization overlay
-
-All overlay elements update once or twice per second; they must never touch the physics timing. Positioned around the play area edges; never obscure the ball.
-
-- **Loss curve** — rolling TD loss over the last ~60 seconds of wall time. Corner sparkline.
-- **Win-rate** — rolling win-rate of the live policy vs. the scripted baseline (while it's still in the loop) and vs. itself.
-- **Policy heatmap** — 2D grid over (ball_x, ball_y) with paddle fixed at center, colored by argmax action (3 colors). The core educational visual: you watch the policy form in real time.
-- **Throughput counter** — inferences/sec and training steps/sec. Use this shamelessly as a bragging number; it reinforces the performance story.
-- **Episode counter, total gradient steps, wall time**.
-
-### Controls
-
-- `Space` — pause / resume simulation (training continues).
-- `R` — reset both networks to random init, wipe replay buffer and league.
-- `P` — toggle human control of the left paddle (arrow keys).
-- `G` — toggle overlay visibility.
-- `F9` — save the last 30 seconds to GIF + MP4 in the user's pictures/videos directory.
-- `Esc` — quit.
-
-### Logging
-
-Structured logs (`tracing`) to stderr at info level by default, with a `--log-file` flag for persistent logs. Training loop should log episode reward, loss, ε, and throughput at a low frequency (once per second). No telemetry phoned home.
-
----
-
-## Architecture
-
-### Dependencies
-
-- [`meganeura`](https://github.com/kvark/meganeura) — network definition, inference, training.
-- [`blade-graphics`](https://github.com/kvark/blade) — rendering.
-- `winit` — window and input.
-- `cosmic-text` (or a minimal bitmap font) — overlay text.
-- `serde` + `toml` — configuration.
-- `tracing` — structured logging.
-- `crossbeam` — lock-free queue for the transition channel.
-- `image` + `gif` — screenshot and recording output.
-
-No PyTorch, no ONNX, no tch-rs, no Candle, no Burn. Meganeura is the point.
-
-### Repository layout
+## Layout
 
 ```
 mega-plays/
-  Cargo.toml              # workspace
-  README.md
-  crates/
-    mp-core/              # replay buffer, DQN loop, visualization primitives, threading harness
-    mp-pong/              # Pong physics, rendering, agent wiring, config
-  apps/
-    pong/                 # thin binary that wires mp-core + mp-pong
-  assets/                 # fonts, shaders, icons
-  tools/
-    py-prototype/         # the Python validation prototype
+├── Cargo.toml                # virtual workspace
+├── crates/
+│   ├── mega-plays/           # driver library: window, Blade context, egui, DQN plumbing
+│   └── mega-pong/            # pong-specific game (physics, observation, rendering)
+└── apps/
+    └── pong/                 # thin binary
 ```
 
-Future games get their own `crates/mp-<game>/` + `apps/<game>/`. Shared RL plumbing stays in `mp-core`. `mp-core` is internal — not intended as a general RL library.
-
-### Configuration
-
-Runtime config in `config.toml` adjacent to the binary, with all defaults compiled in so the binary runs with no config file present.
+Future games land as additional `crates/mega-<name>` + `apps/<name>` pairs.
+`mega-plays` is internal plumbing — not a general RL library.
 
 ## Building
+
+Both `mega-plays` and `meganeura` are under active co-development. The
+workspace consumes meganeura via a relative path dependency, so during
+development you need the two repos checked out side by side:
+
+```
+my-work/
+├── meganeura/        # on branch claude/game-learning-agents-nSKEt
+└── mega-plays/       # on branch claude/game-learning-agents-nSKEt
+```
+
+Then, from `mega-plays/`:
 
 ```
 cargo run --release -p pong
 ```
 
-Release mode is mandatory — debug builds will miss the convergence window and misrepresent throughput.
+Release mode is strongly preferred — debug throughput on the training
+loop is not representative and the overlay stats will misread.
+
+## Design choices and departures from the original sketch
+
+The `README` version that seeded this project served as a design brief;
+the following notes explain where the implementation diverged and why.
+
+### Rendering goes through egui — no `cosmic-text`, no custom pipeline
+
+Every on-screen element — paddles, ball, scores, stats, sparklines — is
+an egui primitive. We do not compile our own WGSL shaders, do not run an
+MSAA resolve pass, and do not depend on `cosmic-text`. Egui ships a
+perfectly serviceable monospace font and tessellates rectangles with
+anti-aliased edges. For tens of primitives per frame (which is every
+game we reasonably care about at this stage) the tessellator is
+invisible in profiles.
+
+When a future game needs thousands of sprites per frame, add a sibling
+crate with a direct Blade pipeline; the driver already owns the
+`Arc<blade_graphics::Context>` needed to build one.
+
+### One Blade context, shared between renderer and meganeura
+
+`meganeura::Session::with_context(plan, Arc<Context>)` — added as part
+of this project on the companion meganeura branch — lets the driver
+create the Blade context once and hand a clone to both the renderer's
+egui painter and the training / inference sessions. Same device, same
+queue, same memory allocator, no device-enumeration surprises.
+
+The corresponding `build_session_on` / `build_inference_session_on`
+helpers thread the shared context through the whole compile pipeline.
+
+### Lockstep blade-graphics versioning
+
+Because two crate versions of the same FFI type are two different
+types at the Rust level, meganeura and mega-plays have to agree on
+*exact* `blade-graphics` version. The workspace pins
+`blade-graphics = "=0.8.2"` — the same version meganeura 0.2 depends
+on. Bumping either side requires bumping both.
+
+### No cross-thread training, yet
+
+The initial driver is single-threaded: each frame runs physics at
+120 Hz against a fixed timestep, selects the agent's action via a
+one-sample inference pass, records a transition, and runs a small
+number of minibatch gradient steps. No lock-free MPSC queue, no
+double-buffered weight handoff. The scaffolding exists exactly where
+it will be swapped in — see the `Agent::train_step` and `Running::tick`
+call sites — but shipping that concurrency now before any numbers are
+measured would be optimising the imagined profile, not the real one.
+
+### DQN variant: mask-based target fitting
+
+The training graph feeds a one-hot action mask and a target Q value
+scattered into the same action slot. The loss is plain MSE:
+
+```
+masked_q = q_all * action_mask
+masked_t = target * action_mask
+loss     = mean((masked_q - masked_t)^2)
+```
+
+Only the column of `fc2` corresponding to the taken action receives
+gradient. This avoids needing a gather op, which meganeura does not
+currently expose. If / when gather lands we can switch to the more
+standard Huber loss over a single Q-value.
+
+### Target network: host-side forward pass, for now
+
+The target network is a parameter snapshot refreshed every N gradient
+steps. Bootstrap targets are computed on host with a straightforward
+MLP evaluation (two matrix multiplies, ReLU) — the MLP is ~4k weights,
+a rounding error next to the GPU training minibatch. When the network
+grows, a dedicated GPU inference session with target parameters is the
+right next step; swapping parameters into the live inference session
+every step would conflict with action selection on the main loop.
+
+## Pong specifics
+
+- 6-float observation: own paddle y, opponent paddle y, ball (x, y), ball (vx, vy).
+- 3 discrete actions: stay, up, down.
+- Reward: +1 on scoring, -1 on being scored on, 0 otherwise.
+- Opponent: scripted tracker with adjustable y-noise (tune from the overlay).
+- Fixed-step physics at 120 Hz; render at whatever the window reports.
+
+Self-play, league sampling, scripted-bootstrap mixing, human control and
+recording are all on the roadmap but intentionally not shipped in v0 —
+we want empirical evidence that the learning loop works against a
+stationary opponent first.
+
+## Controls
+
+- `Space` — pause / resume physics (training continues).
+- `G` — toggle overlay.
+- `R` — reset agent weights and replay buffer.
+- `Esc` — quit.
 
 ## Platform support
 
-- **macOS**: Metal via blade-graphics. Primary development target. Universal binary, notarized.
-- **Windows**: Vulkan or DX12 via blade-graphics. MSI installer, signed.
-- **Linux**: Vulkan. AppImage or plain tarball.
+- **macOS**: Metal via blade-graphics. Primary development target.
+- **Linux**: Vulkan.
+- **Windows**: Vulkan or DX12 via blade-graphics.
 
-No WebGPU — blade-graphics has no WebGPU backend.
-
----
-
-## Roadmap
-
-- **v0.1** — Pong as specified above.
-- **v0.2** — Polish, packaging, signed binaries, launch.
-- **v0.3** — Second game. Candidates: catch-the-falling-object, simple top-down arena, Breakout.
-- **v0.4+** — CNN-on-pixels mode, multi-agent variants, small league tournaments with Elo tracking.
+No WebGPU — blade-graphics does not ship a WebGPU backend.
 
 ## Non-goals
 
@@ -178,4 +166,5 @@ MIT.
 
 ## Credits
 
-Built on [Meganeura](https://github.com/kvark/meganeura) and [blade-graphics](https://github.com/kvark/blade).
+Built on [meganeura](https://github.com/kvark/meganeura) and
+[blade-graphics](https://github.com/kvark/blade).

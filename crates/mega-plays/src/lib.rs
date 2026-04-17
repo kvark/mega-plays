@@ -1,0 +1,25 @@
+//! Shared plumbing for live-learning game demos.
+//!
+//! The crate wires three independent pieces into one binary:
+//!
+//! 1. A Blade-graphics renderer with an egui overlay. Egui handles all
+//!    on-screen drawing — paddles, balls, stats, sparklines. There is no
+//!    custom shader, no MSAA juggling, and no text-shaping dependency;
+//!    egui already ships fonts and primitive shapes.
+//! 2. A meganeura training session that runs on the *same*
+//!    `blade_graphics::Context` as the renderer. The context is created
+//!    once, wrapped in `Arc`, and cloned into [`meganeura::Session::with_context`].
+//! 3. A replay buffer and DQN trainer glue that a concrete [`Game`]
+//!    implementation plugs into.
+//!
+//! A binary (see `apps/pong`) supplies a [`Game`] and calls [`run`].
+
+pub mod agent;
+pub mod app;
+pub mod game;
+pub mod stats;
+
+pub use agent::{Action, Agent, AgentConfig, Observation, Transition};
+pub use app::{AppConfig, run};
+pub use game::Game;
+pub use stats::{RollingStats, SparkLine};
