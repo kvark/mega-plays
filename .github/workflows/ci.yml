@@ -52,7 +52,10 @@ jobs:
 
       - name: Format
         working-directory: mega-plays
-        run: cargo fmt --all -- --check
+        # Deliberately not `--all`: with a path dependency on meganeura,
+        # `cargo fmt --all` traverses into the sibling checkout and
+        # enforces our rustfmt defaults on files we don't own.
+        run: cargo fmt -- --check
 
       - name: Clippy
         working-directory: mega-plays
