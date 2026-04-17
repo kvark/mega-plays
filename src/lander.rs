@@ -250,44 +250,44 @@ impl Game for LanderGame {
         ]
     }
 
-    fn paint(&self, painter: &Painter, rect: Rect) {
+    fn paint(&self, painter: &Painter, rect: Rect, alpha: u8) {
         let (sx, sy) = (rect.width() / PLAY_WIDTH, rect.height() / PLAY_HEIGHT);
         let cx = rect.center().x;
         let cy = rect.center().y;
         let to_screen = |p: Vec2| Pos2::new(cx + p.x * sx, cy - p.y * sy);
+        let tint = |c: Color32| crate::tint(c, alpha);
 
-        // Sky backdrop.
-        painter.rect_filled(rect, 0.0, Color32::from_rgb(12, 16, 28));
-
-        // Stars — deterministic from a simple hash so they don't jitter
-        // frame to frame but still look natural.
-        for i in 0..24_u32 {
-            let h = ((i * 2654435761) ^ 0xdeadbeef) as f32;
-            let sx_ = ((h * 0.000_000_12).fract() - 0.5) * PLAY_WIDTH;
-            let sy_ = (((h * 0.000_000_73).fract()) - 0.2) * 0.9;
-            painter.circle_filled(
-                to_screen(Vec2::new(sx_, sy_.max(-0.3))),
-                1.0,
-                Color32::from_gray(80 + ((i as u8) & 0x3f)),
+        // Backdrop + static scenery are only drawn on the opaque
+        // pass. In the alpha-blended overlay view, 16 ghost passes
+        // would otherwise re-stamp the sky and drown out the ghosts.
+        if alpha == 255 {
+            painter.rect_filled(rect, 0.0, Color32::from_rgb(12, 16, 28));
+            for i in 0..24_u32 {
+                let h = ((i * 2654435761) ^ 0xdeadbeef) as f32;
+                let sx_ = ((h * 0.000_000_12).fract() - 0.5) * PLAY_WIDTH;
+                let sy_ = (((h * 0.000_000_73).fract()) - 0.2) * 0.9;
+                painter.circle_filled(
+                    to_screen(Vec2::new(sx_, sy_.max(-0.3))),
+                    1.0,
+                    Color32::from_gray(80 + ((i as u8) & 0x3f)),
+                );
+            }
+            let ground_y_screen = to_screen(Vec2::new(0.0, GROUND_Y)).y;
+            painter.line_segment(
+                [
+                    Pos2::new(rect.min.x, ground_y_screen),
+                    Pos2::new(rect.max.x, ground_y_screen),
+                ],
+                Stroke::new(1.5, Color32::from_gray(110)),
+            );
+            let pad_top_left = to_screen(Vec2::new(-PAD_HALF_W, GROUND_Y + 0.02));
+            let pad_bot_right = to_screen(Vec2::new(PAD_HALF_W, GROUND_Y));
+            painter.rect_filled(
+                Rect::from_two_pos(pad_top_left, pad_bot_right),
+                CornerRadius::ZERO,
+                Color32::from_rgb(210, 200, 90),
             );
         }
-
-        // Ground line + pad.
-        let ground_y_screen = to_screen(Vec2::new(0.0, GROUND_Y)).y;
-        painter.line_segment(
-            [
-                Pos2::new(rect.min.x, ground_y_screen),
-                Pos2::new(rect.max.x, ground_y_screen),
-            ],
-            Stroke::new(1.5, Color32::from_gray(110)),
-        );
-        let pad_top_left = to_screen(Vec2::new(-PAD_HALF_W, GROUND_Y + 0.02));
-        let pad_bot_right = to_screen(Vec2::new(PAD_HALF_W, GROUND_Y));
-        painter.rect_filled(
-            Rect::from_two_pos(pad_top_left, pad_bot_right),
-            CornerRadius::ZERO,
-            Color32::from_rgb(210, 200, 90),
-        );
 
         // Lander: body triangle + landing legs, rotated by `angle`.
         let rot = |p: Vec2| {
@@ -305,18 +305,17 @@ impl Game for LanderGame {
             .collect();
         painter.add(egui::Shape::convex_polygon(
             verts,
-            Color32::from_rgb(200, 210, 220),
-            Stroke::new(1.0, Color32::from_gray(40)),
+            tint(Color32::from_rgb(200, 210, 220)),
+            Stroke::new(1.0, tint(Color32::from_gray(40))),
         ));
         let leg_l = to_screen(self.pos + rot(Vec2::new(-BODY_HALF_W * 1.2, -BODY_HALF_H)));
         let leg_r = to_screen(self.pos + rot(Vec2::new(BODY_HALF_W * 1.2, -BODY_HALF_H)));
         let leg_anchor_l = to_screen(self.pos + rot(Vec2::new(-BODY_HALF_W, -BODY_HALF_H * 0.6)));
         let leg_anchor_r = to_screen(self.pos + rot(Vec2::new(BODY_HALF_W, -BODY_HALF_H * 0.6)));
-        let leg_stroke = Stroke::new(1.5, Color32::from_gray(180));
+        let leg_stroke = Stroke::new(1.5, tint(Color32::from_gray(180)));
         painter.line_segment([leg_anchor_l, leg_l], leg_stroke);
         painter.line_segment([leg_anchor_r, leg_r], leg_stroke);
 
-        // Flame when main engine is firing.
         if self.last_thrusting {
             let flame_local = [
                 Vec2::new(-BODY_HALF_W * 0.5, -BODY_HALF_H * 0.6),
@@ -329,7 +328,7 @@ impl Game for LanderGame {
                 .collect();
             painter.add(egui::Shape::convex_polygon(
                 flame_verts,
-                Color32::from_rgb(255, 160, 40),
+                tint(Color32::from_rgb(255, 160, 40)),
                 Stroke::NONE,
             ));
         }

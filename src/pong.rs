@@ -222,30 +222,34 @@ impl Game for PongGame {
         ]
     }
 
-    fn paint(&self, painter: &Painter, rect: Rect) {
+    fn paint(&self, painter: &Painter, rect: Rect, alpha: u8) {
         let (sx, sy) = (rect.width() / PLAY_WIDTH, rect.height() / PLAY_HEIGHT);
         let cx = rect.center().x;
         let cy = rect.center().y;
         let to_screen = |p: Pos2| Pos2::new(cx + p.x * sx, cy - p.y * sy);
 
-        // Court backdrop + centre line.
-        painter.rect_filled(rect, 0.0, Color32::from_rgb(14, 16, 22));
-        let dash_len = 0.04 * sy;
-        let gap = 0.03 * sy;
-        let mut y = rect.min.y;
-        let white = Color32::from_rgb(90, 96, 110);
-        while y < rect.max.y {
-            painter.line_segment(
-                [
-                    Pos2::new(cx, y),
-                    Pos2::new(cx, (y + dash_len).min(rect.max.y)),
-                ],
-                Stroke::new(1.0, white),
-            );
-            y += dash_len + gap;
+        // Court backdrop + centre line — only the opaque pass (alpha
+        // 255) paints these, so stacked overlays don't repaint the
+        // background and drown out the ghosts behind it.
+        if alpha == 255 {
+            painter.rect_filled(rect, 0.0, Color32::from_rgb(14, 16, 22));
+            let dash_len = 0.04 * sy;
+            let gap = 0.03 * sy;
+            let mut y = rect.min.y;
+            let white = Color32::from_rgb(90, 96, 110);
+            while y < rect.max.y {
+                painter.line_segment(
+                    [
+                        Pos2::new(cx, y),
+                        Pos2::new(cx, (y + dash_len).min(rect.max.y)),
+                    ],
+                    Stroke::new(1.0, white),
+                );
+                y += dash_len + gap;
+            }
         }
 
-        let paddle_color = Color32::from_rgb(220, 225, 235);
+        let paddle_color = crate::tint(Color32::from_rgb(220, 225, 235), alpha);
         let paddle = |painter: &Painter, x: f32, paddle_y: f32| {
             let tl = to_screen(Pos2::new(x - PADDLE_WIDTH, paddle_y + PADDLE_HEIGHT * 0.5));
             let br = to_screen(Pos2::new(x + PADDLE_WIDTH, paddle_y - PADDLE_HEIGHT * 0.5));
@@ -263,22 +267,25 @@ impl Game for PongGame {
             paddle_color,
         );
 
-        // Score.
-        let score_color = Color32::from_rgb(200, 210, 225);
-        painter.text(
-            Pos2::new(cx - rect.width() * 0.15, rect.min.y + 24.0),
-            egui::Align2::CENTER_TOP,
-            format!("{}", self.score_agent),
-            egui::FontId::monospace(28.0),
-            score_color,
-        );
-        painter.text(
-            Pos2::new(cx + rect.width() * 0.15, rect.min.y + 24.0),
-            egui::Align2::CENTER_TOP,
-            format!("{}", self.score_opponent),
-            egui::FontId::monospace(28.0),
-            score_color,
-        );
+        // Score — suppress in ghost passes so 16 overlapping score
+        // numbers don't pile up as an unreadable blob.
+        if alpha == 255 {
+            let score_color = Color32::from_rgb(200, 210, 225);
+            painter.text(
+                Pos2::new(cx - rect.width() * 0.15, rect.min.y + 24.0),
+                egui::Align2::CENTER_TOP,
+                format!("{}", self.score_agent),
+                egui::FontId::monospace(28.0),
+                score_color,
+            );
+            painter.text(
+                Pos2::new(cx + rect.width() * 0.15, rect.min.y + 24.0),
+                egui::Align2::CENTER_TOP,
+                format!("{}", self.score_opponent),
+                egui::FontId::monospace(28.0),
+                score_color,
+            );
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui) {
