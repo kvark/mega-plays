@@ -12,6 +12,10 @@ description = "Live-learning game demos built on Blade and Meganeura."
 name = "pong"
 path = "src/bin/pong.rs"
 
+[[bin]]
+name = "lander"
+path = "src/bin/lander.rs"
+
 [dependencies]
 # Pinned exactly to meganeura 0.2.0's blade-graphics dep. Bumping either
 # side requires bumping both in lockstep, or the session and the renderer
