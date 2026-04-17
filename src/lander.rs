@@ -263,7 +263,7 @@ impl Game for LanderGame {
         if alpha == 255 {
             painter.rect_filled(rect, 0.0, Color32::from_rgb(12, 16, 28));
             for i in 0..24_u32 {
-                let h = ((i * 2654435761) ^ 0xdeadbeef) as f32;
+                let h = ((i.wrapping_mul(2_654_435_761)) ^ 0xdead_beef) as f32;
                 let sx_ = ((h * 0.000_000_12).fract() - 0.5) * PLAY_WIDTH;
                 let sy_ = (((h * 0.000_000_73).fract()) - 0.2) * 0.9;
                 painter.circle_filled(
