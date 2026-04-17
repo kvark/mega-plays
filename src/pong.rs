@@ -36,6 +36,24 @@ pub const PHYSICS_DT: f32 = 1.0 / 120.0;
 pub const PLAY_WIDTH: f32 = 2.0;
 pub const PLAY_HEIGHT: f32 = 1.0;
 
+/// Scripted opponent speed, relative to the agent. Below 1.0 makes it
+/// trackable. Default 0.25 lets a random policy score ~1 in 4 episodes,
+/// which is enough density of +1 rewards for DQN to learn quickly.
+/// Crank it up via the in-UI slider once the agent is competent.
+pub const OPPONENT_SPEED_FRACTION: f32 = 0.25;
+
+/// Terminal reward magnitude. Scoring is `±TERMINAL_REWARD`. Scaling
+/// above ±1 makes the sparse terminal signal dominate the mean-squared
+/// Bellman loss against an otherwise-zero batch of non-terminal
+/// transitions. DQN learning speed on small networks is very
+/// sensitive to this.
+pub const TERMINAL_REWARD: f32 = 10.0;
+
+/// Small dense reward for aligning the agent paddle with the ball.
+/// Provides a non-terminal gradient signal so the policy has something
+/// to optimise before the first terminal reward lands in replay.
+pub const SHAPING_WEIGHT: f32 = 0.05;
+
 pub struct PongGame {
     agent_y: f32,
     opponent_y: f32,
@@ -44,6 +62,8 @@ pub struct PongGame {
     score_agent: u32,
     score_opponent: u32,
     opponent_noise: f32,
+    opponent_speed_frac: f32,
+    shaping_weight: f32,
     rng: rand::rngs::ThreadRng,
 }
 
@@ -56,7 +76,9 @@ impl PongGame {
             ball_vel: Vec2::ZERO,
             score_agent: 0,
             score_opponent: 0,
-            opponent_noise: 0.04,
+            opponent_noise: 0.08,
+            opponent_speed_frac: OPPONENT_SPEED_FRACTION,
+            shaping_weight: SHAPING_WEIGHT,
             rng: rand::rng(),
         };
         g.reset_ball(true);
@@ -86,7 +108,8 @@ impl PongGame {
         use rand::Rng;
         let target = self.ball.y + self.rng.random_range(-self.opponent_noise..self.opponent_noise);
         let diff = target - self.opponent_y;
-        let step = diff.clamp(-PADDLE_SPEED * dt, PADDLE_SPEED * dt);
+        let max_step = PADDLE_SPEED * self.opponent_speed_frac * dt;
+        let step = diff.clamp(-max_step, max_step);
         let half = PLAY_HEIGHT * 0.5 - PADDLE_HEIGHT * 0.5;
         self.opponent_y = (self.opponent_y + step).clamp(-half, half);
     }
@@ -133,12 +156,12 @@ impl PongGame {
         if self.ball.x < -PLAY_WIDTH * 0.5 {
             self.score_opponent += 1;
             self.reset_ball(false);
-            return (-1.0, true);
+            return (-TERMINAL_REWARD, true);
         }
         if self.ball.x > PLAY_WIDTH * 0.5 {
             self.score_agent += 1;
             self.reset_ball(true);
-            return (1.0, true);
+            return (TERMINAL_REWARD, true);
         }
         (0.0, false)
     }
@@ -171,8 +194,18 @@ impl Game for PongGame {
         let dt = PHYSICS_DT;
         self.agent_y = Self::move_paddle(self.agent_y, action, dt);
         self.update_opponent(dt);
-        let (reward, done) = self.collide(dt);
-        StepOutcome { reward, done }
+        let (terminal_r, done) = self.collide(dt);
+        // Dense shaping: small negative reward proportional to paddle /
+        // ball y-misalignment. Pushes the agent to track the ball even
+        // while epsilon-greedy random actions dominate the replay
+        // buffer. Zero weight disables it.
+        let alignment = (self.ball.y - self.agent_y).abs() / (PLAY_HEIGHT * 0.5);
+        let shaping = -self.shaping_weight * alignment;
+        StepOutcome {
+            reward: terminal_r + shaping,
+            done,
+            terminal_reward: terminal_r,
+        }
     }
 
     fn observation(&self) -> Observation {
@@ -253,6 +286,14 @@ impl Game for PongGame {
         ui.add(
             egui::Slider::new(&mut self.opponent_noise, 0.0..=0.3)
                 .text("opponent noise"),
+        );
+        ui.add(
+            egui::Slider::new(&mut self.opponent_speed_frac, 0.2..=1.2)
+                .text("opponent speed"),
+        );
+        ui.add(
+            egui::Slider::new(&mut self.shaping_weight, 0.0..=0.1)
+                .text("shaping reward"),
         );
     }
 }

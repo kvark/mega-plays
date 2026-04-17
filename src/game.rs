@@ -33,8 +33,14 @@ pub struct GameSpec {
 /// A reward and episode-boundary signal.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StepOutcome {
+    /// Total reward this step — terminal + any dense shaping.
     pub reward: f32,
+    /// True when the episode ends on this step.
     pub done: bool,
+    /// The sparse terminal-reward component (±1 for win/loss, 0 while
+    /// in play). The harness uses this — not `reward` — to count wins
+    /// so that shaping can't skew the scoreboard.
+    pub terminal_reward: f32,
 }
 
 pub trait Game {

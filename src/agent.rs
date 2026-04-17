@@ -1,22 +1,20 @@
-//! DQN agent: MLP policy, experience replay, target network.
+//! DQN agent: MLP policy, experience replay, target network, vectorised
+//! inference.
 //!
 //! Design notes:
 //!
 //! - The policy is a small MLP built at runtime via meganeura. Two
-//!   sessions share one Blade context: an *inference* session for the
-//!   live policy, and a *training* session that owns autodiff + Adam
-//!   state. After each gradient step the updated parameters are read
-//!   back to host memory and re-uploaded into the inference session.
-//!   That host-side round trip is negligible for the few-thousand-
-//!   parameter MLPs the initial games use; when networks grow, a
-//!   GPU-side weight copy becomes worth the effort.
+//!   sessions share one Blade context: an *inference* session with a
+//!   fixed batch of `num_envs` (one forward pass per simulation
+//!   substep for every parallel environment), and a *training* session
+//!   that owns autodiff + Adam state. After each gradient step the
+//!   updated parameters are read back to host memory and re-uploaded
+//!   into the inference session. That round trip is negligible for
+//!   the ~few-thousand-parameter MLPs used here; when networks grow,
+//!   a GPU-side weight copy becomes worth the effort.
 //!
 //! - Transitions live in a plain `VecDeque<Transition>`. No lock-free
-//!   queue: the driver is single-threaded for the initial iteration,
-//!   and a tiny replay buffer is not a bottleneck. If and when
-//!   training moves to a background thread, swap the buffer and the
-//!   weight sync for the double-buffer pattern described in the
-//!   project README.
+//!   queue — the driver is single-threaded for the initial iteration.
 
 use std::{collections::VecDeque, sync::Arc};
 
@@ -41,8 +39,8 @@ pub struct Transition {
     pub done: bool,
 }
 
-/// DQN hyperparameters. Sensible defaults for small, fast-converging
-/// tasks like Pong — not a general-purpose RL configuration.
+/// DQN hyperparameters tuned for small, fast-converging tasks like
+/// Pong — not a general-purpose RL configuration.
 #[derive(Clone, Debug)]
 pub struct AgentConfig {
     pub hidden: usize,
@@ -63,14 +61,14 @@ pub struct AgentConfig {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            hidden: 64,
-            replay_capacity: 100_000,
-            batch_size: 256,
-            discount: 0.99,
-            learning_rate: 1e-3,
+            hidden: 128,
+            replay_capacity: 50_000,
+            batch_size: 128,
+            discount: 0.97,
+            learning_rate: 3e-4,
             epsilon_start: 1.0,
             epsilon_end: 0.05,
-            epsilon_decay_secs: 60.0,
+            epsilon_decay_secs: 45.0,
             target_sync_interval: 1000,
             warmup: 1024,
         }
@@ -93,6 +91,7 @@ pub struct Agent {
     cfg: AgentConfig,
     obs_dim: usize,
     num_actions: u32,
+    num_envs: usize,
 
     inference: Session,
     training: Session,
@@ -115,11 +114,14 @@ impl Agent {
         gpu: Arc<blade_graphics::Context>,
         obs_dim: usize,
         num_actions: u32,
+        num_envs: usize,
         cfg: AgentConfig,
     ) -> Self {
-        // --- Inference graph: obs[1, obs_dim] -> q[1, num_actions] ---
+        assert!(num_envs >= 1, "num_envs must be ≥ 1");
+
+        // Inference graph: obs[num_envs, obs_dim] -> q[num_envs, num_actions]
         let mut g_inf = Graph::new();
-        let obs = g_inf.input("obs", &[1, obs_dim]);
+        let obs = g_inf.input("obs", &[num_envs, obs_dim]);
         let fc1 = nn::Linear::new(&mut g_inf, "fc1", obs_dim, cfg.hidden);
         let fc2 = nn::Linear::new(&mut g_inf, "fc2", cfg.hidden, num_actions as usize);
         let h = fc1.forward(&mut g_inf, obs);
@@ -127,13 +129,7 @@ impl Agent {
         let q = fc2.forward(&mut g_inf, h);
         g_inf.set_outputs(vec![q]);
 
-        // --- Training graph: MSE on the selected Q vs. TD target ---
-        //
-        // We feed a one-hot action mask and the bootstrap target
-        // scattered into the same slot. For non-selected actions both
-        // masked_q and masked_t are zero so the corresponding MSE terms
-        // vanish — the gradient only touches the chosen-action column of
-        // fc2. This avoids needing a gather op.
+        // Training graph: masked MSE (see loss definition in the crate README).
         let mut g_train = Graph::new();
         let batch = cfg.batch_size;
         let obs_b = g_train.input("obs", &[batch, obs_dim]);
@@ -188,11 +184,20 @@ impl Agent {
             cfg,
             obs_dim,
             num_actions,
+            num_envs,
         };
 
         agent.init_parameters();
         agent.target_snapshot = agent.snapshot_training();
         agent
+    }
+
+    pub fn num_envs(&self) -> usize {
+        self.num_envs
+    }
+
+    pub fn obs_dim(&self) -> usize {
+        self.obs_dim
     }
 
     fn init_parameters(&mut self) {
@@ -230,29 +235,46 @@ impl Agent {
         }
     }
 
-    /// Epsilon-greedy action given current wall-time seconds since start.
-    pub fn select_action(&mut self, obs: &[f32], wall_secs: f32) -> Action {
+    /// Epsilon-greedy actions for a batch of `num_envs` observations.
+    ///
+    /// `obs_batch` is the flat row-major layout: `[env0.obs, env1.obs,
+    /// ..., envN-1.obs]`, length `num_envs * obs_dim`.
+    pub fn select_actions(&mut self, obs_batch: &[f32], wall_secs: f32) -> Vec<Action> {
+        assert_eq!(obs_batch.len(), self.num_envs * self.obs_dim);
+        self.inference.set_input("obs", obs_batch);
+        self.inference.step();
+        // step() submits async; read_output maps CPU-side memory whose
+        // contents are undefined until the GPU has finished. Skipping
+        // wait() here silently returns stale data and breaks training.
+        self.inference.wait();
+        self.inferences += self.num_envs as u64;
+
+        let na = self.num_actions as usize;
+        let mut q = vec![0.0_f32; self.num_envs * na];
+        self.inference.read_output_by_index(0, &mut q);
+
         let eps = self.current_epsilon(wall_secs);
-        if self.rng.random::<f32>() < eps {
-            return self.rng.random_range(0..self.num_actions);
+        let mut out = Vec::with_capacity(self.num_envs);
+        for i in 0..self.num_envs {
+            let a = if self.rng.random::<f32>() < eps {
+                self.rng.random_range(0..self.num_actions)
+            } else {
+                argmax(&q[i * na..(i + 1) * na]) as Action
+            };
+            out.push(a);
         }
-        let q = self.q_values(obs);
-        argmax(&q) as Action
+        out
     }
 
     pub fn current_epsilon(&self, wall_secs: f32) -> f32 {
+        // Debug knob: pin epsilon to a fixed value for sanity checks.
+        if let Ok(v) = std::env::var("MEGAPLAYS_FORCE_EPSILON") {
+            if let Ok(f) = v.parse::<f32>() {
+                return f.clamp(0.0, 1.0);
+            }
+        }
         let t = (wall_secs / self.cfg.epsilon_decay_secs).clamp(0.0, 1.0);
         self.cfg.epsilon_start + (self.cfg.epsilon_end - self.cfg.epsilon_start) * t
-    }
-
-    fn q_values(&mut self, obs: &[f32]) -> Vec<f32> {
-        assert_eq!(obs.len(), self.obs_dim);
-        self.inference.set_input("obs", obs);
-        self.inference.step();
-        self.inferences += 1;
-        let mut out = vec![0.0_f32; self.num_actions as usize];
-        self.inference.read_output_by_index(0, &mut out);
-        out
     }
 
     pub fn record(&mut self, t: Transition) {
@@ -264,14 +286,6 @@ impl Agent {
 
     /// Run one minibatch gradient step if enough transitions have been
     /// collected. Returns the loss, or `None` when skipped.
-    ///
-    /// Target-network bootstrap is computed on host from
-    /// `self.target_snapshot`. The snapshot is refreshed every
-    /// `target_sync_interval` gradient steps. For the initial iteration
-    /// the target is `r + γ · max_a Q_target(next_obs, a)` where
-    /// Q_target uses the snapshot parameters fed into an ad-hoc CPU
-    /// forward pass — the network is small enough that this is cheaper
-    /// than a second inference session.
     pub fn train_step(&mut self) -> Option<f32> {
         if self.replay.len() < self.cfg.warmup.max(self.cfg.batch_size) {
             return None;
@@ -285,8 +299,7 @@ impl Agent {
         let mut mask = vec![0.0_f32; batch * na];
         let mut target = vec![0.0_f32; batch * na];
 
-        let indices: Vec<usize> = (0..self.replay.len())
-            .choose_multiple(&mut self.rng, batch);
+        let indices: Vec<usize> = (0..self.replay.len()).choose_multiple(&mut self.rng, batch);
 
         for (i, &ri) in indices.iter().enumerate() {
             let t = &self.replay[ri];
@@ -308,6 +321,7 @@ impl Agent {
         self.training
             .set_adam(self.cfg.learning_rate, 0.9, 0.999, 1e-8);
         self.training.step();
+        self.training.wait();
         self.gradient_steps += 1;
 
         let loss = self.training.read_output(1).first().copied().unwrap_or(0.0);
@@ -319,16 +333,15 @@ impl Agent {
             self.steps_since_target_sync = 0;
         }
 
-        // Keep the inference session in sync after every step. For
-        // larger networks this should happen every N steps.
         self.sync_inference_from_training();
 
         Some(loss)
     }
 
-    /// Forward pass through the target network on host (CPU). The MLP is
-    /// tiny, and this keeps training self-contained without a third GPU
-    /// session for target-Q evaluation.
+    /// Forward pass through the target network on host (CPU). The MLP
+    /// is tiny, so this beats a third GPU session for target-Q
+    /// evaluation: no extra compile, no extra pipeline, no extra
+    /// parameter-upload traffic each target-sync interval.
     fn target_forward_max(&self, obs: &[f32]) -> f32 {
         let w1 = &self.target_snapshot[0];
         let b1 = &self.target_snapshot[1];
