@@ -198,6 +198,57 @@ stationary opponent first.
 - `R` — reset agent weights and replay buffer.
 - `Esc` — quit.
 
+## Candidates for the next game
+
+The harness is deliberately game-agnostic: a new game is one `impl Game`
+module plus a thin `src/bin/<name>.rs` that wires it into [`run`].
+We're explicitly looking for the shortest possible feedback loop —
+something that converges in well under a minute on a modest laptop
+GPU, keeps the observation space flat and ≤ ~16 floats, and produces
+an on-screen policy the viewer can *see* getting better.
+
+Ranked by how well they fit the "visibly learning within 30 s" brief:
+
+1. **Catch / paddle-under-faller.** One paddle along the bottom, one
+   ball dropping from a random x with a sideways velocity. Reward
+   +1 on catch, -1 on miss, episodes ~1 s. Easier than pong —
+   tracking without an adversary — so even a poorly-tuned network
+   converges in ~15 s and makes the harness's own behaviour easy to
+   isolate from DQN difficulty. Good first "is the stack healthy?"
+   smoke test.
+2. **Grid-based find-the-food.** 8×8 grid, agent + food glyph, 4
+   directional actions, reward on reaching food, new food spawns on
+   eat. Observation: one-hot agent + food positions, 128 floats.
+   Trivial physics, classic RL benchmark, benefits directly from
+   the vectorised-env pipeline we already have (16 grids train much
+   faster than one).
+3. **Lunar lander, stripped.** 2D craft with thrust + two side
+   thrusters, reward for soft touchdown on a flat pad. 8-float
+   state (pos, vel, rotation, angular vel). A richer policy story
+   (continuous control in a discrete-action shell) and dramatic
+   visuals — the lander visibly stops flailing as it learns.
+   Noticeably harder than pong; likely needs Double-DQN or a softer
+   target-update schedule before it converges reliably.
+4. **Flappy-pipe.** Agent with gravity + one "flap" action, pipes
+   scroll in. Episodes end on hit. Famous for being almost trivial
+   with the right reward shaping and catastrophic without it — a
+   good stress test for the harness's stability knobs.
+5. **Simple arena-dodger.** Agent dodges projectiles in an arena;
+   reward is time alive. Related in shape to pong but single-agent,
+   no opponent model needed. A reasonable step toward the multi-
+   agent / league-sampling variants sketched above.
+
+**Non-candidates for now** — Breakout (physics is only superficially
+simple; tile state blows observation size), Atari-pixel games
+(CNN-on-pixels is an explicit v0.4 goal, not v0.2), anything
+multi-agent (needs the self-play machinery we haven't built yet).
+
+My preference for the second game is **catch**: smallest added
+surface area, fastest convergence, makes the harness numbers easy
+to trust across games. Ranking up from there depends on whether we
+first want a second smoke test (catch) or a second *interesting*
+learning story (grid or lander).
+
 ## Platform support
 
 - **macOS**: Metal via blade-graphics. Primary development target.

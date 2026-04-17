@@ -106,7 +106,10 @@ impl PongGame {
 
     fn update_opponent(&mut self, dt: f32) {
         use rand::Rng;
-        let target = self.ball.y + self.rng.random_range(-self.opponent_noise..self.opponent_noise);
+        let target = self.ball.y
+            + self
+                .rng
+                .random_range(-self.opponent_noise..self.opponent_noise);
         let diff = target - self.opponent_y;
         let max_step = PADDLE_SPEED * self.opponent_speed_frac * dt;
         let step = diff.clamp(-max_step, max_step);
@@ -233,7 +236,10 @@ impl Game for PongGame {
         let white = Color32::from_rgb(90, 96, 110);
         while y < rect.max.y {
             painter.line_segment(
-                [Pos2::new(cx, y), Pos2::new(cx, (y + dash_len).min(rect.max.y))],
+                [
+                    Pos2::new(cx, y),
+                    Pos2::new(cx, (y + dash_len).min(rect.max.y)),
+                ],
                 Stroke::new(1.0, white),
             );
             y += dash_len + gap;
@@ -252,10 +258,7 @@ impl Game for PongGame {
         // Ball.
         let ball_screen = to_screen(self.ball);
         painter.rect_filled(
-            Rect::from_center_size(
-                ball_screen,
-                Vec2::splat(BALL_RADIUS * 2.0 * sx.min(sy)),
-            ),
+            Rect::from_center_size(ball_screen, Vec2::splat(BALL_RADIUS * 2.0 * sx.min(sy))),
             CornerRadius::ZERO,
             paddle_color,
         );
@@ -283,17 +286,8 @@ impl Game for PongGame {
             "score            {} - {}",
             self.score_agent, self.score_opponent
         ));
-        ui.add(
-            egui::Slider::new(&mut self.opponent_noise, 0.0..=0.3)
-                .text("opponent noise"),
-        );
-        ui.add(
-            egui::Slider::new(&mut self.opponent_speed_frac, 0.2..=1.2)
-                .text("opponent speed"),
-        );
-        ui.add(
-            egui::Slider::new(&mut self.shaping_weight, 0.0..=0.1)
-                .text("shaping reward"),
-        );
+        ui.add(egui::Slider::new(&mut self.opponent_noise, 0.0..=0.3).text("opponent noise"));
+        ui.add(egui::Slider::new(&mut self.opponent_speed_frac, 0.2..=1.2).text("opponent speed"));
+        ui.add(egui::Slider::new(&mut self.shaping_weight, 0.0..=0.1).text("shaping reward"));
     }
 }

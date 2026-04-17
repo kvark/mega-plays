@@ -1,0 +1,67 @@
+name: CI
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux (lavapipe)
+            os: ubuntu-latest
+          - name: macOS (Metal)
+            os: macos-latest
+    steps:
+      - name: Checkout mega-plays
+        uses: actions/checkout@v4
+        with:
+          path: mega-plays
+
+      # The workspace consumes meganeura through a relative path
+      # dependency (`../meganeura`). Mirror the same layout in CI by
+      # checking out kvark/meganeura next to us.
+      - name: Checkout meganeura
+        uses: actions/checkout@v4
+        with:
+          repository: kvark/meganeura
+          ref: main
+          path: meganeura
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Install lavapipe and Vulkan
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers vulkan-tools libvulkan-dev
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: mega-plays
+
+      - name: Format
+        working-directory: mega-plays
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        working-directory: mega-plays
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build
+        working-directory: mega-plays
+        run: cargo build --release --bin pong
+
+      - name: Unit tests
+        working-directory: mega-plays
+        run: cargo test --workspace --lib

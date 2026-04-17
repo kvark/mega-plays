@@ -55,7 +55,7 @@ impl Default for AppConfig {
 /// `build_game` is called `num_envs` times, each with a clone of the
 /// shared `Arc<Context>`. Games are independent; each gets its own
 /// [`Game`] instance.
-pub fn run<G, F>(config: AppConfig, mut build_game: F)
+pub fn run<G, F>(config: AppConfig, build_game: F)
 where
     G: Game + 'static,
     F: FnMut(Arc<gpu::Context>) -> G + 'static,
@@ -65,7 +65,7 @@ where
     let event_loop = winit::event_loop::EventLoop::new().expect("event loop");
     let mut app = App::<G> {
         state: AppState::Uninit {
-            build_game: Some(Box::new(move |ctx| build_game(ctx))),
+            build_game: Some(Box::new(build_game)),
             config,
         },
     };
@@ -82,7 +82,7 @@ enum AppState<G: Game> {
         build_game: Option<Builder<G>>,
         config: AppConfig,
     },
-    Running(Running<G>),
+    Running(Box<Running<G>>),
     Dead,
 }
 
@@ -92,17 +92,16 @@ struct App<G: Game> {
 
 impl<G: Game + 'static> winit::application::ApplicationHandler for App<G> {
     fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
-        let (mut build_game, config) =
-            match std::mem::replace(&mut self.state, AppState::Dead) {
-                AppState::Uninit { build_game, config } => (
-                    build_game.expect("resumed called twice without a game builder"),
-                    config,
-                ),
-                other => {
-                    self.state = other;
-                    return;
-                }
-            };
+        let (mut build_game, config) = match std::mem::replace(&mut self.state, AppState::Dead) {
+            AppState::Uninit { build_game, config } => (
+                build_game.expect("resumed called twice without a game builder"),
+                config,
+            ),
+            other => {
+                self.state = other;
+                return;
+            }
+        };
 
         let gpu = unsafe {
             gpu::Context::init(gpu::ContextDesc {
@@ -115,7 +114,9 @@ impl<G: Game + 'static> winit::application::ApplicationHandler for App<G> {
         .expect("init Blade context");
         let gpu = Arc::new(gpu);
 
-        let games: Vec<G> = (0..config.num_envs).map(|_| build_game(gpu.clone())).collect();
+        let games: Vec<G> = (0..config.num_envs)
+            .map(|_| build_game(gpu.clone()))
+            .collect();
         let spec = games[0].spec();
 
         let window_attributes = winit::window::Window::default_attributes()
@@ -139,8 +140,7 @@ impl<G: Game + 'static> winit::application::ApplicationHandler for App<G> {
 
         let egui_ctx = egui::Context::default();
         let viewport_id = egui_ctx.viewport_id();
-        let egui_winit =
-            egui_winit::State::new(egui_ctx, viewport_id, &window, None, None, None);
+        let egui_winit = egui_winit::State::new(egui_ctx, viewport_id, &window, None, None, None);
 
         let agent = Agent::new(
             gpu.clone(),
@@ -155,7 +155,7 @@ impl<G: Game + 'static> winit::application::ApplicationHandler for App<G> {
             .and_then(|s| s.parse::<f32>().ok());
 
         let now = Instant::now();
-        self.state = AppState::Running(Running {
+        self.state = AppState::Running(Box::new(Running {
             gpu,
             surface,
             command_encoder,
@@ -188,7 +188,7 @@ impl<G: Game + 'static> winit::application::ApplicationHandler for App<G> {
             exit_deadline,
             frame_counter: 0,
             last_heartbeat: 0.0,
-        });
+        }));
     }
 
     fn about_to_wait(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop) {
@@ -504,11 +504,7 @@ impl<G: Game> Running<G> {
         self.render(&primitives, &egui_output.textures_delta, &screen_desc);
     }
 
-    fn build_ui(
-        &mut self,
-        ctx: &egui::Context,
-        event_loop: &winit::event_loop::ActiveEventLoop,
-    ) {
+    fn build_ui(&mut self, ctx: &egui::Context, event_loop: &winit::event_loop::ActiveEventLoop) {
         let clear = self.config.clear_color;
         egui::CentralPanel::default()
             .frame(
@@ -579,16 +575,25 @@ impl<G: Game> Running<G> {
 
                 ui.separator();
                 ui.add(
-                    egui::Slider::new(&mut self.speed_mul, 1..=32).text("speed").integer(),
+                    egui::Slider::new(&mut self.speed_mul, 1..=32)
+                        .text("speed")
+                        .integer(),
                 );
-                if ui.button(if self.paused { "resume [Space]" } else { "pause [Space]" }).clicked() {
+                if ui
+                    .button(if self.paused {
+                        "resume [Space]"
+                    } else {
+                        "pause [Space]"
+                    })
+                    .clicked()
+                {
                     self.paused = !self.paused;
                 }
 
                 ui.separator();
                 ui.label("training loss");
-                let (loss_rect, _) = ui
-                    .allocate_exact_size(Vec2::new(260.0, 80.0), egui::Sense::hover());
+                let (loss_rect, _) =
+                    ui.allocate_exact_size(Vec2::new(260.0, 80.0), egui::Sense::hover());
                 draw_plot(
                     ui.painter(),
                     loss_rect,
@@ -598,8 +603,8 @@ impl<G: Game> Running<G> {
                 );
 
                 ui.label("episode return (200)");
-                let (ret_rect, _) = ui
-                    .allocate_exact_size(Vec2::new(260.0, 60.0), egui::Sense::hover());
+                let (ret_rect, _) =
+                    ui.allocate_exact_size(Vec2::new(260.0, 60.0), egui::Sense::hover());
                 draw_plot(
                     ui.painter(),
                     ret_rect,
@@ -609,8 +614,8 @@ impl<G: Game> Running<G> {
                 );
 
                 ui.label("instantaneous reward");
-                let (rew_rect, _) = ui
-                    .allocate_exact_size(Vec2::new(260.0, 30.0), egui::Sense::hover());
+                let (rew_rect, _) =
+                    ui.allocate_exact_size(Vec2::new(260.0, 30.0), egui::Sense::hover());
                 SparkLine::draw(
                     ui.painter(),
                     rew_rect,
@@ -715,10 +720,7 @@ fn draw_plot(
     let grid = Stroke::new(0.5, Color32::from_gray(40));
     for i in 1..4 {
         let y = rect.min.y + rect.height() * i as f32 / 4.0;
-        painter.line_segment(
-            [Pos2::new(rect.min.x, y), Pos2::new(rect.max.x, y)],
-            grid,
-        );
+        painter.line_segment([Pos2::new(rect.min.x, y), Pos2::new(rect.max.x, y)], grid);
     }
 
     if stats.len() < 2 {
