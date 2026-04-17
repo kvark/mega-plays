@@ -434,16 +434,24 @@ impl<G: Game> Running<G> {
             };
             let na = self.spec.num_actions as usize;
             let act_sum: u64 = self.action_hist[..na].iter().sum();
-            let act_frac = |a: usize| {
-                if act_sum > 0 {
+            let mut action_str = String::with_capacity(4 * na);
+            action_str.push('[');
+            for a in 0..na {
+                if a > 0 {
+                    action_str.push('/');
+                }
+                let frac = if act_sum > 0 {
                     self.action_hist[a] as f32 / act_sum as f32
                 } else {
                     0.0
-                }
-            };
+                };
+                use std::fmt::Write;
+                let _ = write!(action_str, "{frac:.2}");
+            }
+            action_str.push(']');
             log::info!(
                 "t={:5.1}s fps={:5.1} eps={:.3} grad={:>5} loss={:.4} \
-                 ret={:6.2} len={:6.1} wins={}/{} ({:.1}%) actions=[{:.2}/{:.2}/{:.2}]",
+                 ret={:6.2} len={:6.1} wins={}/{} ({:.1}%) actions={}",
                 wall,
                 self.frame_counter as f32 / wall,
                 self.agent.current_epsilon(wall),
@@ -454,9 +462,7 @@ impl<G: Game> Running<G> {
                 self.scores_agent,
                 total,
                 win_rate * 100.0,
-                act_frac(0),
-                act_frac(1),
-                act_frac(2),
+                action_str,
             );
             for h in self.action_hist.iter_mut() {
                 *h = 0;

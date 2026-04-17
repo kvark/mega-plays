@@ -9,10 +9,24 @@ visibly improving within a minute, converged within a few.
 
 ## Status
 
-Alive, noisily learning. The pong binary opens a window with a 4×4 grid
-of parallel pong games, all driven by one shared DQN policy and one
-shared replay buffer. Each physics substep does one batched inference
-pass on the shared policy to produce 16 actions in parallel.
+Alive, noisily learning. Two games so far:
+
+- **pong** — 4×4 grid of parallel games against a scripted tracker.
+  Win rate climbs from random (~11 %) toward 20 %+ within the first
+  minute before epsilon decays.
+- **lander** — 16 parallel lunar-lander instances with one rigid body
+  in constant-gravity, 3 discrete thrusters, and a small pad to hit
+  softly. Physics and rendering are solid; the DQN does not yet
+  reliably land on the pad in CPU-Vulkan smoke tests. Sparse ±10
+  reward plus a 4-action space needs more samples — or a better
+  algorithm — than a 2-minute xvfb run produces.
+
+Both run as separate binaries (`cargo run --release --bin pong` /
+`--bin lander`). They share the `mega-plays` library: same driver,
+same DQN agent, same overlay — only the `Game` impl differs.
+
+Each physics substep does one batched inference pass on the shared
+policy to produce N actions in parallel.
 
 Measured on Xvfb + lavapipe (CPU Vulkan, the worst-case target):
 ~25 fps rendering, ~50 gradient steps / sec, warmup fills the 50 k
@@ -37,8 +51,10 @@ mega-plays/
 │   ├── game.rs               # Game trait
 │   ├── stats.rs              # rolling stats, sparkline
 │   ├── pong.rs               # Pong physics + rendering
+│   ├── lander.rs             # Lunar lander physics + rendering
 │   └── bin/
-│       └── pong.rs           # thin binary
+│       ├── pong.rs
+│       └── lander.rs
 ```
 
 Future games land as additional `src/<name>.rs` modules and
@@ -191,6 +207,27 @@ stationary opponent first.
 - `R` — reset agent weights and replay buffer.
 - `Esc` — quit.
 
+## Lander specifics
+
+- 7-float observation: position (x, y), velocity (vx, vy),
+  `sin/cos` of the lander's angle, angular velocity / 2.
+- 4 discrete actions: idle, main engine, left RCS, right RCS.
+- Physics: pure semi-implicit Euler, constant gravity (`g = 0.8`),
+  main thrust `1.6` along the craft's "up" axis, RCS torque
+  `4 rad/s²`. No physics library — the craft is one rigid body in
+  a horizontal-ground world, which doesn't need one.
+- Terminal reward: `+10` for a soft landing on the pad (upright,
+  slow, inside ±0.15 of centre), `+2` for a soft landing off-pad,
+  `-10` for a crash or going out of the horizontal bounds.
+- Shaping: small per-step penalties for distance to the pad, tilt,
+  and thrust usage — same idea as pong's tracking shaping, kept
+  small relative to the sparse ±10 terminal.
+
+Both rendering and physics are dependency-free beyond the `glam`
+we already use. The lander is drawn as a triangle body plus landing
+legs; the main engine plume shows as an orange triangle under the
+craft while firing.
+
 ## Candidates for the next game
 
 The harness is deliberately game-agnostic: a new game is one `impl Game`
@@ -200,33 +237,24 @@ something that converges in well under a minute on a modest laptop
 GPU, keeps the observation space flat and ≤ ~16 floats, and produces
 an on-screen policy the viewer can *see* getting better.
 
-Ranked by how well they fit the "visibly learning within 30 s" brief:
+With pong and lander shipped, the remaining candidates, ranked by
+how well they fit the "visibly learning within 30 s" brief:
 
 1. **Catch / paddle-under-faller.** One paddle along the bottom, one
    ball dropping from a random x with a sideways velocity. Reward
    +1 on catch, -1 on miss, episodes ~1 s. Easier than pong —
    tracking without an adversary — so even a poorly-tuned network
    converges in ~15 s and makes the harness's own behaviour easy to
-   isolate from DQN difficulty. Good first "is the stack healthy?"
-   smoke test.
+   isolate from DQN difficulty.
 2. **Grid-based find-the-food.** 8×8 grid, agent + food glyph, 4
-   directional actions, reward on reaching food, new food spawns on
-   eat. Observation: one-hot agent + food positions, 128 floats.
-   Trivial physics, classic RL benchmark, benefits directly from
-   the vectorised-env pipeline we already have (16 grids train much
-   faster than one).
-3. **Lunar lander, stripped.** 2D craft with thrust + two side
-   thrusters, reward for soft touchdown on a flat pad. 8-float
-   state (pos, vel, rotation, angular vel). A richer policy story
-   (continuous control in a discrete-action shell) and dramatic
-   visuals — the lander visibly stops flailing as it learns.
-   Noticeably harder than pong; likely needs Double-DQN or a softer
-   target-update schedule before it converges reliably.
-4. **Flappy-pipe.** Agent with gravity + one "flap" action, pipes
+   directional actions. Trivial physics, classic RL benchmark,
+   benefits directly from the vectorised-env pipeline we already
+   have (16 grids train much faster than one).
+3. **Flappy-pipe.** Agent with gravity + one "flap" action, pipes
    scroll in. Episodes end on hit. Famous for being almost trivial
    with the right reward shaping and catastrophic without it — a
    good stress test for the harness's stability knobs.
-5. **Simple arena-dodger.** Agent dodges projectiles in an arena;
+4. **Simple arena-dodger.** Agent dodges projectiles in an arena;
    reward is time alive. Related in shape to pong but single-agent,
    no opponent model needed. A reasonable step toward the multi-
    agent / league-sampling variants sketched above.
@@ -235,12 +263,6 @@ Ranked by how well they fit the "visibly learning within 30 s" brief:
 simple; tile state blows observation size), Atari-pixel games
 (CNN-on-pixels is an explicit v0.4 goal, not v0.2), anything
 multi-agent (needs the self-play machinery we haven't built yet).
-
-My preference for the second game is **catch**: smallest added
-surface area, fastest convergence, makes the harness numbers easy
-to trust across games. Ranking up from there depends on whether we
-first want a second smoke test (catch) or a second *interesting*
-learning story (grid or lander).
 
 ## Platform support
 

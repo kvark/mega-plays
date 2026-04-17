@@ -29,6 +29,7 @@
 pub mod agent;
 pub mod app;
 pub mod game;
+pub mod lander;
 pub mod pong;
 pub mod stats;
 
