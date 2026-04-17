@@ -235,9 +235,11 @@ impl Game for PongGame {
             painter.rect_filled(rect, 0.0, Color32::from_rgb(14, 16, 22));
             let dash_len = 0.04 * sy;
             let gap = 0.03 * sy;
-            let mut y = rect.min.y;
             let white = Color32::from_rgb(90, 96, 110);
-            while y < rect.max.y {
+            let stride = dash_len + gap;
+            let dash_count = (rect.height() / stride).ceil() as u32;
+            for i in 0..dash_count {
+                let y = rect.min.y + i as f32 * stride;
                 painter.line_segment(
                     [
                         Pos2::new(cx, y),
@@ -245,7 +247,6 @@ impl Game for PongGame {
                     ],
                     Stroke::new(1.0, white),
                 );
-                y += dash_len + gap;
             }
         }
 

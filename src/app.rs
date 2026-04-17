@@ -208,9 +208,11 @@ impl<G: Game + 'static> winit::application::ApplicationHandler for App<G> {
         _window_id: winit::window::WindowId,
         event: winit::event::WindowEvent,
     ) {
-        let r = match &mut self.state {
-            AppState::Running(r) => r,
-            _ => return,
+        use winit::event::{ElementState, KeyEvent, WindowEvent};
+        use winit::keyboard::{KeyCode, PhysicalKey};
+
+        let AppState::Running(r) = &mut self.state else {
+            return;
         };
 
         let response = r.egui_winit.on_window_event(&r.window, &event);
@@ -220,9 +222,6 @@ impl<G: Game + 'static> winit::application::ApplicationHandler for App<G> {
         if response.consumed {
             return;
         }
-
-        use winit::event::{ElementState, KeyEvent, WindowEvent};
-        use winit::keyboard::{KeyCode, PhysicalKey};
 
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
@@ -357,8 +356,7 @@ impl<G: Game> Running<G> {
             .iter()
             .enumerate()
             .max_by_key(|&(_, len)| *len)
-            .map(|(i, _)| i)
-            .unwrap_or(0)
+            .map_or(0, |(i, _)| i)
     }
 
     fn tick(&mut self) {
@@ -454,6 +452,7 @@ impl<G: Game> Running<G> {
                 0.0
             };
             let na = self.spec.num_actions as usize;
+            use std::fmt::Write;
             let act_sum: u64 = self.action_hist[..na].iter().sum();
             let mut action_str = String::with_capacity(4 * na);
             action_str.push('[');
@@ -466,7 +465,6 @@ impl<G: Game> Running<G> {
                 } else {
                     0.0
                 };
-                use std::fmt::Write;
                 let _ = write!(action_str, "{frac:.2}");
             }
             action_str.push(']');
@@ -817,7 +815,7 @@ fn draw_plot(
     if stats.len() < 2 {
         return;
     }
-    let transform = |v: f32| if log_y { (1.0 + v.max(0.0)).ln() } else { v };
+    let transform = |v: f32| if log_y { v.max(0.0).ln_1p() } else { v };
     let (lo, hi) = stats.min_max();
     let (lo_t, hi_t) = (transform(lo), transform(hi));
     let span = (hi_t - lo_t).max(1e-6);
