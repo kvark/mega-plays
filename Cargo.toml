@@ -1,19 +1,18 @@
-[workspace]
-resolver = "2"
-members = [
-    "crates/mega-plays",
-    "crates/mega-pong",
-    "apps/pong",
-]
-
-[workspace.package]
+[package]
+name = "mega-plays"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
 repository = "https://github.com/kvark/mega-plays"
 authors = ["Dzmitry Malyshau"]
+description = "Live-learning game demos built on Blade and Meganeura."
 
-[workspace.dependencies]
+[[bin]]
+name = "pong"
+path = "src/bin/pong.rs"
+
+[dependencies]
 # Pinned exactly to meganeura 0.2.0's blade-graphics dep. Bumping either
 # side requires bumping both in lockstep, or the session and the renderer
 # will silently link two copies of the GPU context type.
@@ -29,13 +28,10 @@ env_logger = "0.11"
 glam = "0.30"
 rand = "0.9"
 
-# Until the `Session::with_context` API ships on crates.io, meganeura is
-# consumed from a sibling checkout. Clone kvark/meganeura next to this
-# repo and check out the matching branch.
+# Until Session::with_context ships on crates.io, meganeura is consumed
+# from a sibling checkout. Clone kvark/meganeura next to this repo and
+# check out the matching branch.
 meganeura = { path = "../meganeura" }
-
-mega-plays = { path = "crates/mega-plays" }
-mega-pong = { path = "crates/mega-pong" }
 
 [profile.release]
 lto = "thin"

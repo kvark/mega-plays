@@ -12,15 +12,16 @@
 //! nothing. A game that needs thousands of sprites per frame should add
 //! a sibling crate with a direct Blade pipeline.
 
-use std::sync::Arc;
-use std::time::Instant;
+use std::{sync::Arc, time::Instant};
 
 use blade_graphics as gpu;
 use egui::{Color32, Rect};
 
-use crate::agent::{Agent, AgentConfig, Transition};
-use crate::game::{Game, GameSpec};
-use crate::stats::{RollingStats, SparkLine};
+use crate::{
+    agent::{Agent, AgentConfig, Transition},
+    game::{Game, GameSpec},
+    stats::{RollingStats, SparkLine},
+};
 
 /// Top-level knobs for [`run`]. The [`AgentConfig`] comes from the game
 /// wiring; everything else governs the host harness.

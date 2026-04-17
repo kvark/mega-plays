@@ -18,13 +18,10 @@
 //!   weight sync for the double-buffer pattern described in the
 //!   project README.
 
-use std::collections::VecDeque;
-use std::sync::Arc;
+use std::{collections::VecDeque, sync::Arc};
 
-use meganeura::nn;
-use meganeura::{Graph, Session};
-use rand::Rng;
-use rand::seq::IteratorRandom;
+use meganeura::{Graph, Session, nn};
+use rand::{Rng, seq::IteratorRandom};
 
 /// Observation vector. Flat f32s, caller-defined layout, normalised to
 /// roughly `[-1, 1]`.
@@ -152,8 +149,23 @@ impl Agent {
         let loss = g_train.mse_loss(masked_q, masked_t);
         g_train.set_outputs(vec![loss]);
 
-        let inference = meganeura::build_inference_session_on(&g_inf, gpu.clone());
-        let training = meganeura::build_session_on(&g_train, gpu);
+        let inference = meganeura::build(
+            &g_inf,
+            meganeura::SessionConfig {
+                mode: meganeura::Mode::Inference,
+                gpu: Some(gpu.clone()),
+                ..meganeura::SessionConfig::default()
+            },
+        )
+        .0;
+        let training = meganeura::build(
+            &g_train,
+            meganeura::SessionConfig {
+                gpu: Some(gpu),
+                ..meganeura::SessionConfig::default()
+            },
+        )
+        .0;
 
         let params = vec![
             ParamShape { name: "fc1.weight".into(), shape: vec![obs_dim, cfg.hidden] },

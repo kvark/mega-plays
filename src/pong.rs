@@ -19,8 +19,11 @@
 //! agent misses, and 0 elsewhere. The episode ends on either score.
 
 use egui::{Color32, CornerRadius, Painter, Pos2, Rect, Stroke, Vec2};
-use mega_plays::agent::{Action, Observation};
-use mega_plays::game::{Game, GameSpec, StepOutcome};
+
+use crate::{
+    agent::{Action, Observation},
+    game::{Game, GameSpec, StepOutcome},
+};
 
 pub const OBS_DIM: usize = 6;
 pub const NUM_ACTIONS: u32 = 3;

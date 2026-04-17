@@ -18,16 +18,21 @@ the original design have not yet been measured on hardware.
 
 ```
 mega-plays/
-├── Cargo.toml                # virtual workspace
-├── crates/
-│   ├── mega-plays/           # driver library: window, Blade context, egui, DQN plumbing
-│   └── mega-pong/            # pong-specific game (physics, observation, rendering)
-└── apps/
-    └── pong/                 # thin binary
+├── Cargo.toml
+├── src/
+│   ├── lib.rs                # re-exports
+│   ├── agent.rs              # DQN agent: replay buffer, target net, meganeura wiring
+│   ├── app.rs                # winit driver, Blade context, egui overlay, main loop
+│   ├── game.rs               # Game trait
+│   ├── stats.rs              # rolling stats, sparkline
+│   ├── pong.rs               # Pong physics + rendering
+│   └── bin/
+│       └── pong.rs           # thin binary
 ```
 
-Future games land as additional `crates/mega-<name>` + `apps/<name>` pairs.
-`mega-plays` is internal plumbing — not a general RL library.
+Future games land as additional `src/<name>.rs` modules and
+`src/bin/<name>.rs` binaries. The crate stays small on purpose and is
+not intended as a general RL library.
 
 ## Building
 
@@ -44,7 +49,7 @@ my-work/
 Then, from `mega-plays/`:
 
 ```
-cargo run --release -p pong
+cargo run --release --bin pong
 ```
 
 Release mode is strongly preferred — debug throughput on the training
@@ -77,8 +82,11 @@ create the Blade context once and hand a clone to both the renderer's
 egui painter and the training / inference sessions. Same device, same
 queue, same memory allocator, no device-enumeration surprises.
 
-The corresponding `build_session_on` / `build_inference_session_on`
-helpers thread the shared context through the whole compile pipeline.
+Context sharing goes through the unified `meganeura::build(graph,
+SessionConfig { gpu: Some(ctx), .. })` entry point, which replaced the
+`build_session` / `build_session_with` / `build_session_with_report` /
+`build_session_cached` / `build_inference_session_with` family on the
+companion branch.
 
 ### Lockstep blade-graphics versioning
 

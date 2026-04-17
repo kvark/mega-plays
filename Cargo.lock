@@ -2175,16 +2175,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mega-pong"
-version = "0.1.0"
-dependencies = [
- "egui",
- "glam",
- "mega-plays",
- "rand 0.9.4",
-]
-
-[[package]]
 name = "meganeura"
 version = "0.2.0"
 dependencies = [
@@ -3015,14 +3005,6 @@ dependencies = [
  "pin-project-lite",
  "rustix 1.1.4",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "pong"
-version = "0.1.0"
-dependencies = [
- "mega-plays",
- "mega-pong",
 ]
 
 [[package]]

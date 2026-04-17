@@ -12,11 +12,12 @@
 //! 3. A replay buffer and DQN trainer glue that a concrete [`Game`]
 //!    implementation plugs into.
 //!
-//! A binary (see `apps/pong`) supplies a [`Game`] and calls [`run`].
+//! A binary (see `src/bin/pong.rs`) supplies a [`Game`] and calls [`run`].
 
 pub mod agent;
 pub mod app;
 pub mod game;
+pub mod pong;
 pub mod stats;
 
 pub use agent::{Action, Agent, AgentConfig, Observation, Transition};
