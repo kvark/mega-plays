@@ -164,10 +164,22 @@ impl Agent {
         .0;
 
         let params = vec![
-            ParamShape { name: "fc1.weight".into(), shape: vec![obs_dim, cfg.hidden] },
-            ParamShape { name: "fc1.bias".into(), shape: vec![cfg.hidden] },
-            ParamShape { name: "fc2.weight".into(), shape: vec![cfg.hidden, num_actions as usize] },
-            ParamShape { name: "fc2.bias".into(), shape: vec![num_actions as usize] },
+            ParamShape {
+                name: "fc1.weight".into(),
+                shape: vec![obs_dim, cfg.hidden],
+            },
+            ParamShape {
+                name: "fc1.bias".into(),
+                shape: vec![cfg.hidden],
+            },
+            ParamShape {
+                name: "fc2.weight".into(),
+                shape: vec![cfg.hidden, num_actions as usize],
+            },
+            ParamShape {
+                name: "fc2.bias".into(),
+                shape: vec![num_actions as usize],
+            },
         ];
 
         let mut agent = Self {

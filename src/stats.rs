@@ -82,12 +82,7 @@ impl RollingStats {
 pub struct SparkLine;
 
 impl SparkLine {
-    pub fn draw(
-        painter: &egui::Painter,
-        rect: Rect,
-        stats: &RollingStats,
-        color: Color32,
-    ) {
+    pub fn draw(painter: &egui::Painter, rect: Rect, stats: &RollingStats, color: Color32) {
         if stats.len() < 2 {
             return;
         }
