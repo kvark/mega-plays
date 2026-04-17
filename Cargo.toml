@@ -28,10 +28,11 @@ env_logger = "0.11"
 glam = "0.30"
 rand = "0.9"
 
-# Until Session::with_context ships on crates.io, meganeura is consumed
-# from a sibling checkout. Clone kvark/meganeura next to this repo and
-# check out the matching branch.
-meganeura = { path = "../meganeura" }
+# Meganeura is consumed as a normal git dependency pinned by SHA. Bump
+# this pin together with the `blade-graphics = "=0.8.2"` pin above if
+# meganeura changes its blade version — see the lockstep-versioning
+# note in the README.
+meganeura = { git = "https://github.com/kvark/meganeura", rev = "33dcf42aa10ec1d8146298bbf40e8f609fb9bd17" }
 
 [profile.release]
 lto = "thin"

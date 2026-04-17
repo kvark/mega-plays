@@ -47,21 +47,14 @@ not intended as a general RL library.
 
 ## Building
 
-Both `mega-plays` and `meganeura` are under active co-development. The
-workspace consumes meganeura via a relative path dependency, so during
-development you need the two repos checked out side by side:
-
-```
-my-work/
-├── meganeura/        # on branch claude/game-learning-agents-nSKEt
-└── mega-plays/       # on branch claude/game-learning-agents-nSKEt
-```
-
-Then, from `mega-plays/`:
-
 ```
 cargo run --release --bin pong
 ```
+
+Meganeura is pulled in as a normal git dependency pinned by SHA in
+`Cargo.toml`. Bump that SHA and the `blade-graphics = "=0.8.2"` pin
+in lockstep if a new meganeura revision changes its blade version —
+see the lockstep-versioning note further down.
 
 Release mode is strongly preferred — debug throughput on the training
 loop is not representative and the overlay stats will misread.

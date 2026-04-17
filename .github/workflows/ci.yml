@@ -20,20 +20,7 @@ jobs:
           - name: macOS (Metal)
             os: macos-latest
     steps:
-      - name: Checkout mega-plays
-        uses: actions/checkout@v4
-        with:
-          path: mega-plays
-
-      # The workspace consumes meganeura through a relative path
-      # dependency (`../meganeura`). Mirror the same layout in CI by
-      # checking out kvark/meganeura next to us.
-      - name: Checkout meganeura
-        uses: actions/checkout@v4
-        with:
-          repository: kvark/meganeura
-          ref: main
-          path: meganeura
+      - uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -47,24 +34,15 @@ jobs:
           sudo apt-get install -y mesa-vulkan-drivers vulkan-tools libvulkan-dev
 
       - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: mega-plays
 
       - name: Format
-        working-directory: mega-plays
-        # Deliberately not `--all`: with a path dependency on meganeura,
-        # `cargo fmt --all` traverses into the sibling checkout and
-        # enforces our rustfmt defaults on files we don't own.
-        run: cargo fmt -- --check
+        run: cargo fmt --all -- --check
 
       - name: Clippy
-        working-directory: mega-plays
         run: cargo clippy --all-targets -- -D warnings
 
       - name: Build
-        working-directory: mega-plays
         run: cargo build --release --bin pong
 
       - name: Unit tests
-        working-directory: mega-plays
         run: cargo test --workspace --lib
