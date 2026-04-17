@@ -9,10 +9,21 @@ visibly improving within a minute, converged within a few.
 
 ## Status
 
-Early scaffolding. The workspace builds, the pong binary opens a window,
-the agent plays against a scripted tracker, and the DQN pipeline is
-wired end-to-end through meganeura. Training convergence targets from
-the original design have not yet been measured on hardware.
+Alive, noisily learning. The pong binary opens a window with a 4×4 grid
+of parallel pong games, all driven by one shared DQN policy and one
+shared replay buffer. Each physics substep does one batched inference
+pass on the shared policy to produce 16 actions in parallel.
+
+Measured on Xvfb + lavapipe (CPU Vulkan, the worst-case target):
+~25 fps rendering, ~50 gradient steps / sec, warmup fills the 50 k
+replay buffer in ~5 seconds, win rate climbs from random (~11 %)
+toward 20 %+ within the first minute before epsilon decays. DQN
+stability is still rough — win rate sometimes regresses under
+sustained training and wants prioritised replay or Double-DQN to
+hold. Those are the obvious next steps.
+
+A real discrete GPU will be dramatically faster — the CPU Vulkan
+numbers are a stress floor, not a target.
 
 ## Layout
 
@@ -55,6 +66,20 @@ cargo run --release --bin pong
 Release mode is strongly preferred — debug throughput on the training
 loop is not representative and the overlay stats will misread.
 
+To smoke-test headlessly (e.g. CI), install `mesa-vulkan-drivers` and
+`xvfb`, then:
+
+```
+VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json \
+XDG_RUNTIME_DIR=/tmp/xdg \
+MEGAPLAYS_EXIT_AFTER_SECS=60 \
+xvfb-run -s "-screen 0 1280x800x24" cargo run --release --bin pong
+```
+
+`MEGAPLAYS_EXIT_AFTER_SECS` self-exits after the given wall time; the
+app prints a per-2-second stats heartbeat so you can watch the win
+rate move without a display.
+
 ## Design choices and departures from the original sketch
 
 The `README` version that seeded this project served as a design brief;
@@ -96,16 +121,36 @@ types at the Rust level, meganeura and mega-plays have to agree on
 `blade-graphics = "=0.8.2"` — the same version meganeura 0.2 depends
 on. Bumping either side requires bumping both.
 
+### Vectorised environments, shared policy
+
+The driver runs `num_envs` (default 16) parallel pong games against a
+single DQN. Every physics substep gathers observations from all
+environments, does **one** batched forward pass through the inference
+session, and picks 16 actions at once. The replay buffer collects
+transitions from all environments indiscriminately. This keeps GPU
+utilisation reasonable on a modest network and means warmup fills in
+seconds rather than minutes.
+
 ### No cross-thread training, yet
 
-The initial driver is single-threaded: each frame runs physics at
-120 Hz against a fixed timestep, selects the agent's action via a
-one-sample inference pass, records a transition, and runs a small
-number of minibatch gradient steps. No lock-free MPSC queue, no
-double-buffered weight handoff. The scaffolding exists exactly where
-it will be swapped in — see the `Agent::train_step` and `Running::tick`
-call sites — but shipping that concurrency now before any numbers are
-measured would be optimising the imagined profile, not the real one.
+The driver is single-threaded: each frame advances physics N times,
+runs one batched inference per substep, and runs a few minibatch
+gradient steps. No lock-free MPSC queue, no double-buffered weight
+handoff. The hooks exist — see `Agent::train_step` and
+`Running::tick` — but shipping that concurrency before any real
+numbers are measured would be optimising the imagined profile.
+
+### `step()` is async; `wait()` before reading
+
+Meganeura's `Session::step` submits GPU work but doesn't block. Reading
+any buffer afterwards (inference outputs, training loss, parameters
+to copy into a target snapshot) without an intervening `wait()` returns
+whatever was in the host-visible memory *before* the submission
+landed. During bring-up this produced a policy that learned a stable
+bad strategy — loss dropped cleanly, but the action choices were
+driven by stale uninitialised Q values. The fix is mundane: `step();
+wait(); read_*(...);` everywhere meganeura's buffers are consumed on
+the host. See `select_actions` and `train_step` in `src/agent.rs`.
 
 ### DQN variant: mask-based target fitting
 
