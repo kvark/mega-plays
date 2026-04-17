@@ -203,7 +203,13 @@ stationary opponent first.
 ## Controls
 
 - `Space` — pause / resume physics (training continues).
-- `G` — toggle overlay.
+- `G` — toggle the stats panel.
+- `V` — switch between **grid** (one tile per env) and **overlay**
+  (all envs painted into the same rect with alpha blending, the
+  current best rollout — longest live episode — on top at full
+  opacity). Super Meat Boy's "replay" screen is the visual
+  reference. Can also be set initially with the env variable
+  `MEGAPLAYS_VIEW=overlay`.
 - `R` — reset agent weights and replay buffer.
 - `Esc` — quit.
 

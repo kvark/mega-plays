@@ -35,5 +35,5 @@ pub mod stats;
 
 pub use agent::{Action, Agent, AgentConfig, Observation, Transition};
 pub use app::{AppConfig, run};
-pub use game::Game;
+pub use game::{Game, tint};
 pub use stats::{RollingStats, SparkLine};

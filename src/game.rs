@@ -12,6 +12,17 @@
 
 use crate::agent::{Action, Observation};
 
+/// Tint `c` by `alpha`, preserving its RGB. Used by [`Game::paint`]
+/// implementations to support the alpha-blended overlay view where
+/// every environment is drawn in the same rect; alpha = 255 leaves
+/// the colour unchanged.
+pub fn tint(c: egui::Color32, alpha: u8) -> egui::Color32 {
+    if alpha == 255 {
+        return c;
+    }
+    egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), alpha)
+}
+
 /// Static description of the environment the driver needs up front —
 /// before opening a window, before building the neural network graph.
 #[derive(Clone, Debug)]
@@ -62,9 +73,15 @@ pub trait Game {
     /// Draw the scene into `painter` within `rect`.
     ///
     /// Coordinates in `rect` are egui screen-space pixels; the
-    /// implementation is responsible for mapping its own play-area units
-    /// into that rect.
-    fn paint(&self, painter: &egui::Painter, rect: egui::Rect);
+    /// implementation is responsible for mapping its own play-area
+    /// units into that rect.
+    ///
+    /// `alpha ∈ 0..=255` scales every primitive's opacity. The
+    /// driver passes `255` in grid mode and a low value in the
+    /// overlay view, where many environments paint into the same
+    /// rect and the "best" one is painted last at full opacity. Use
+    /// [`tint`] to modulate colour constants without branching.
+    fn paint(&self, painter: &egui::Painter, rect: egui::Rect, alpha: u8);
 
     /// Game-specific panel contents (scores, mode toggles, etc.).
     /// Called once per frame inside the stats window.

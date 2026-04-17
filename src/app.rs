@@ -153,6 +153,10 @@ impl<G: Game + 'static> winit::application::ApplicationHandler for App<G> {
         let exit_deadline = std::env::var("MEGAPLAYS_EXIT_AFTER_SECS")
             .ok()
             .and_then(|s| s.parse::<f32>().ok());
+        let view_mode = match std::env::var("MEGAPLAYS_VIEW").ok().as_deref() {
+            Some("overlay") => ViewMode::Overlay,
+            _ => ViewMode::Grid,
+        };
 
         let now = Instant::now();
         self.state = AppState::Running(Box::new(Running {
@@ -184,6 +188,7 @@ impl<G: Game + 'static> winit::application::ApplicationHandler for App<G> {
             physics_accum: 0.0,
             paused: false,
             show_overlay: true,
+            view_mode,
             speed_mul: 1,
             exit_deadline,
             frame_counter: 0,
@@ -234,6 +239,7 @@ impl<G: Game + 'static> winit::application::ApplicationHandler for App<G> {
                 KeyCode::Escape => event_loop.exit(),
                 KeyCode::Space => r.paused = !r.paused,
                 KeyCode::KeyG => r.show_overlay = !r.show_overlay,
+                KeyCode::KeyV => r.view_mode = r.view_mode.toggled(),
                 KeyCode::KeyR => r.reset_learning(),
                 _ => {}
             },
@@ -280,6 +286,7 @@ struct Running<G: Game> {
 
     paused: bool,
     show_overlay: bool,
+    view_mode: ViewMode,
     /// Speed multiplier from the UI slider. Total substeps per frame
     /// is `base_substeps_per_frame * speed_mul`.
     speed_mul: u32,
@@ -338,6 +345,20 @@ impl<G: Game> Running<G> {
         }
         self.last_obs.clear();
         self.last_action.clear();
+    }
+
+    /// Index of the env to paint on top in overlay mode. We use the
+    /// longest-running *current* episode as a proxy for "doing best
+    /// right now": for pong that's the longest rally, for lander it's
+    /// the agent that has survived the most substeps without
+    /// crashing. Ties break toward the lowest-index env.
+    fn hero_env(&self) -> usize {
+        self.episode_len
+            .iter()
+            .enumerate()
+            .max_by_key(|&(_, len)| *len)
+            .map(|(i, _)| i)
+            .unwrap_or(0)
     }
 
     fn tick(&mut self) {
@@ -512,6 +533,8 @@ impl<G: Game> Running<G> {
 
     fn build_ui(&mut self, ctx: &egui::Context, event_loop: &winit::event_loop::ActiveEventLoop) {
         let clear = self.config.clear_color;
+        let play_aspect = self.spec.play_area[0] / self.spec.play_area[1];
+        let view_mode = self.view_mode;
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::default()
@@ -520,31 +543,57 @@ impl<G: Game> Running<G> {
             )
             .show(ctx, |ui| {
                 let rect = ui.max_rect();
-                let (cols, rows) = grid_dims(self.games.len());
-                let cell_w = rect.width() / cols as f32;
-                let cell_h = rect.height() / rows as f32;
-                let pad = 2.0;
-                let play_aspect = self.spec.play_area[0] / self.spec.play_area[1];
-
                 let painter = ui.painter();
-                for (i, g) in self.games.iter().enumerate() {
-                    let col = i % cols;
-                    let row = i / cols;
-                    let cell = Rect::from_min_size(
-                        Pos2::new(
-                            rect.min.x + col as f32 * cell_w + pad,
-                            rect.min.y + row as f32 * cell_h + pad,
-                        ),
-                        Vec2::new(cell_w - 2.0 * pad, cell_h - 2.0 * pad),
-                    );
-                    let play = fit_rect(cell, play_aspect);
-                    g.paint(painter, play);
-                    painter.rect_stroke(
-                        cell,
-                        0.0,
-                        Stroke::new(1.0, Color32::from_gray(28)),
-                        egui::StrokeKind::Inside,
-                    );
+                match view_mode {
+                    ViewMode::Grid => {
+                        let (cols, rows) = grid_dims(self.games.len());
+                        let cell_w = rect.width() / cols as f32;
+                        let cell_h = rect.height() / rows as f32;
+                        let pad = 2.0;
+                        for (i, g) in self.games.iter().enumerate() {
+                            let col = i % cols;
+                            let row = i / cols;
+                            let cell = Rect::from_min_size(
+                                Pos2::new(
+                                    rect.min.x + col as f32 * cell_w + pad,
+                                    rect.min.y + row as f32 * cell_h + pad,
+                                ),
+                                Vec2::new(cell_w - 2.0 * pad, cell_h - 2.0 * pad),
+                            );
+                            let play = fit_rect(cell, play_aspect);
+                            g.paint(painter, play, 255);
+                            painter.rect_stroke(
+                                cell,
+                                0.0,
+                                Stroke::new(1.0, Color32::from_gray(28)),
+                                egui::StrokeKind::Inside,
+                            );
+                        }
+                    }
+                    ViewMode::Overlay => {
+                        // Super-Meat-Boy-style: every env in the same
+                        // rect. The "hero" env (longest current episode
+                        // — proxy for best live performer) paints last
+                        // at full opacity; the rest are alpha-blended
+                        // ghosts, so the active attempt stands out
+                        // against a cloud of parallel runs.
+                        let play = fit_rect(rect, play_aspect);
+                        let hero = self.hero_env();
+                        let ghost_alpha = ghost_alpha_for(self.games.len());
+                        for (i, g) in self.games.iter().enumerate() {
+                            if i == hero {
+                                continue;
+                            }
+                            g.paint(painter, play, ghost_alpha);
+                        }
+                        self.games[hero].paint(painter, play, 255);
+                        painter.rect_stroke(
+                            play,
+                            0.0,
+                            Stroke::new(1.5, Color32::from_rgb(230, 210, 90)),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
                 }
             });
 
@@ -585,6 +634,11 @@ impl<G: Game> Running<G> {
                         .text("speed")
                         .integer(),
                 );
+                ui.horizontal(|ui| {
+                    ui.label("view [V]");
+                    ui.selectable_value(&mut self.view_mode, ViewMode::Grid, "grid");
+                    ui.selectable_value(&mut self.view_mode, ViewMode::Overlay, "overlay");
+                });
                 if ui
                     .button(if self.paused {
                         "resume [Space]"
@@ -697,6 +751,37 @@ fn grid_dims(n: usize) -> (usize, usize) {
     let cols = (n as f32).sqrt().ceil().max(1.0) as usize;
     let rows = n.div_ceil(cols);
     (cols, rows)
+}
+
+/// Layout of the central panel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewMode {
+    /// One tile per environment — the default "see all agents at once".
+    Grid,
+    /// Every environment paints into the same rect; the hero env
+    /// (currently the one with the longest live episode) paints last
+    /// at full opacity over the alpha-blended ghosts. Super Meat Boy
+    /// replay-style.
+    Overlay,
+}
+
+impl ViewMode {
+    fn toggled(self) -> Self {
+        match self {
+            Self::Grid => Self::Overlay,
+            Self::Overlay => Self::Grid,
+        }
+    }
+}
+
+/// Alpha used for ghost envs in overlay mode. Tuned so that 16
+/// overlapping ghosts read as a softly-saturated cloud without
+/// drowning out the hero.
+fn ghost_alpha_for(n_envs: usize) -> u8 {
+    // Inverse proportional to sqrt(N) with a reasonable floor — 4
+    // envs read at ~80, 16 envs read at ~40, 64 envs read at ~20.
+    let n = (n_envs as f32).max(1.0);
+    ((160.0 / n.sqrt()).clamp(16.0, 200.0)) as u8
 }
 
 fn fit_rect(avail: Rect, aspect: f32) -> Rect {
