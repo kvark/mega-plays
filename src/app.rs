@@ -61,6 +61,10 @@ where
     F: FnMut(Arc<gpu::Context>) -> G + 'static,
 {
     env_logger::init();
+    // Drop-guard that saves a Perfetto-compatible `.pftrace` on exit
+    // (path controlled by MEGA_TRACE, default `./mega-plays.pftrace`).
+    // Kept alive for the whole event loop — dropped when `run` returns.
+    let _profile_guard = crate::profiling::init_or_default();
 
     let event_loop = winit::event_loop::EventLoop::new().expect("event loop");
     let mut app = App::<G> {
@@ -164,6 +168,7 @@ impl<G: Game + 'static> winit::application::ApplicationHandler for App<G> {
             surface,
             command_encoder,
             prev_sync_point: None,
+            prev_submit_offset_ns: None,
             gui_painter,
             window,
             egui_winit,
@@ -253,6 +258,12 @@ struct Running<G: Game> {
     surface: gpu::Surface,
     command_encoder: gpu::CommandEncoder,
     prev_sync_point: Option<gpu::SyncPoint>,
+    /// Nanosecond profile-epoch offset captured just before the most
+    /// recent submit. The timestamp-query results from that submit are
+    /// readable once the fence signals, which happens before the next
+    /// frame's `render()` waits; we forward them to the GPU track
+    /// tagged with this offset so they align with the submit point.
+    prev_submit_offset_ns: Option<u64>,
     gui_painter: blade_egui::GuiPainter,
 
     window: winit::window::Window,
@@ -360,6 +371,7 @@ impl<G: Game> Running<G> {
     }
 
     fn tick(&mut self) {
+        let _tick = tracing::info_span!("tick").entered();
         if self.last_obs.len() != self.games.len() {
             self.last_obs = vec![None; self.games.len()];
             self.last_action = vec![0; self.games.len()];
@@ -386,12 +398,17 @@ impl<G: Game> Running<G> {
         let mut obs_buf = vec![0.0_f32; num_envs * obs_dim];
 
         for _ in 0..total_subs {
+            let _sub = tracing::info_span!("substep").entered();
             for (i, g) in self.games.iter().enumerate() {
                 let o = g.observation();
                 obs_buf[i * obs_dim..(i + 1) * obs_dim].copy_from_slice(&o);
             }
-            let actions = self.agent.select_actions(&obs_buf, wall);
+            let actions = {
+                let _s = tracing::info_span!("select_actions").entered();
+                self.agent.select_actions(&obs_buf, wall)
+            };
 
+            let _physics = tracing::info_span!("physics").entered();
             for (i, g) in self.games.iter_mut().enumerate() {
                 let outcome = g.step(actions[i]);
                 let next = g.observation();
@@ -429,8 +446,12 @@ impl<G: Game> Running<G> {
             self.physics_accum = (self.physics_accum - self.spec.physics_dt).max(0.0);
         }
 
+        let _train = tracing::info_span!("train").entered();
         for _ in 0..self.config.train_steps_per_frame {
-            if let Some(loss) = self.agent.train_step() {
+            if let Some(loss) = {
+                let _s = tracing::info_span!("train_step").entered();
+                self.agent.train_step()
+            } {
                 self.loss_hist.push(loss);
             } else {
                 break;
@@ -700,7 +721,11 @@ impl<G: Game> Running<G> {
         gui_textures: &egui::TexturesDelta,
         screen_desc: &blade_egui::ScreenDescriptor,
     ) {
-        let frame = self.surface.acquire_frame();
+        let _render = tracing::info_span!("render").entered();
+        let frame = {
+            let _s = tracing::info_span!("acquire_frame").entered();
+            self.surface.acquire_frame()
+        };
         let frame_view = frame.texture_view();
         self.command_encoder.start();
         self.command_encoder.init_texture(frame.texture());
@@ -709,6 +734,7 @@ impl<G: Game> Running<G> {
             .update_textures(&mut self.command_encoder, gui_textures, &self.gpu);
 
         {
+            let _draw = tracing::info_span!("encode_ui").entered();
             let mut pass = self.command_encoder.render(
                 "draw ui",
                 gpu::RenderTargetSet {
@@ -725,13 +751,34 @@ impl<G: Game> Running<G> {
         }
 
         self.command_encoder.present(frame);
-        let sync_point = self.gpu.submit(&mut self.command_encoder);
+        // Capture the shared-epoch timestamp immediately before submit so
+        // blade's per-pass timings from *this* encoder land at the right
+        // offset on the Perfetto GPU track. The timings themselves become
+        // readable after the corresponding fence signals, which blade
+        // takes care of internally on the next submit — we just re-read
+        // them off the encoder once the wait below has returned, then
+        // forward to the profiler.
+        let submit_offset_ns = crate::profiling::now_ns();
+        let sync_point = {
+            let _s = tracing::info_span!("submit").entered();
+            self.gpu.submit(&mut self.command_encoder)
+        };
         self.gui_painter.after_submit(&sync_point);
 
         if let Some(sp) = self.prev_sync_point.take() {
+            let _s = tracing::info_span!("wait_prev").entered();
             let _ = self.gpu.wait_for(&sp, !0);
         }
+        // Now that the previous frame's fence has been waited on (or
+        // there was no previous frame), blade has resolved the *previous*
+        // submit's timestamp queries. Drain them onto the GPU track, using
+        // the submit-offset we captured for that previous frame.
+        if let Some(prev_offset) = self.prev_submit_offset_ns.take() {
+            let timings = self.command_encoder.timings().clone();
+            crate::profiling::record_gpu_passes(prev_offset, &timings);
+        }
         self.prev_sync_point = Some(sync_point);
+        self.prev_submit_offset_ns = Some(submit_offset_ns);
     }
 
     fn destroy(&mut self) {

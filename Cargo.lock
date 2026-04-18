@@ -2171,6 +2171,7 @@ dependencies = [
  "log",
  "meganeura",
  "rand 0.9.4",
+ "tracing",
  "winit",
 ]
 

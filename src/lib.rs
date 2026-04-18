@@ -31,6 +31,7 @@ pub mod app;
 pub mod game;
 pub mod lander;
 pub mod pong;
+pub mod profiling;
 pub mod stats;
 
 pub use agent::{Action, Agent, AgentConfig, Observation, Transition};

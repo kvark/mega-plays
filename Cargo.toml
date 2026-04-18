@@ -31,6 +31,9 @@ log = "0.4"
 env_logger = "0.11"
 glam = "0.30"
 rand = "0.9"
+# Shared with meganeura (already a transitive dep); used to emit CPU
+# spans that meganeura's profiler captures onto the Perfetto track.
+tracing = { version = "0.1", default-features = false, features = ["std"] }
 
 # Meganeura is consumed as a normal git dependency pinned by SHA. Bump
 # this pin together with the `blade-graphics = "=0.8.2"` pin above if
