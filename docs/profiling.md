@@ -43,6 +43,20 @@ fn main() {
 `MEGA_TRACE=path` overrides the destination, `MEGA_TRACE=off`
 disables.
 
+### Headless trace generation
+
+On hosts without a usable display surface (xvfb without DRI3, CI
+runners, headless servers), set `MEGA_HEADLESS=<frames>` to run the
+tick loop directly — no winit, no window, no render — for that many
+frames. `MEGA_HEADLESS=1` defaults to 2000 frames. The resulting
+`.pftrace` has full CPU spans and meganeura GPU-pass timings on the
+same tracks; blade render-pass timings are absent because `render()`
+is skipped. Example:
+
+```
+MEGA_HEADLESS=500 MEGA_TRACE=/tmp/pong.pftrace cargo run --release --bin pong
+```
+
 ### CPU spans (in `app.rs`)
 
 - `tick`: one span around the whole `tick` method (physics +

@@ -66,6 +66,22 @@ where
     // Kept alive for the whole event loop — dropped when `run` returns.
     let _profile_guard = crate::profiling::init_or_default();
 
+    // Headless mode — MEGA_HEADLESS=1 or MEGA_HEADLESS=<frames>. Skips
+    // window/surface/render entirely (no presentation, no DRI3) and
+    // runs the tick loop for `frames` iterations. Intended for trace
+    // generation on machines where blade can't acquire a display
+    // surface (e.g. xvfb without DRI3, CI runners). The compute path
+    // — context init, games, agent training, meganeura dispatches —
+    // is exercised fully; only the egui render pass is omitted.
+    if let Ok(v) = std::env::var("MEGA_HEADLESS") {
+        let frames: u32 = match v.as_str() {
+            "1" | "" => 2000,
+            s => s.parse().unwrap_or(2000),
+        };
+        run_headless(config, build_game, frames);
+        return;
+    }
+
     let event_loop = winit::event_loop::EventLoop::new().expect("event loop");
     let mut app = App::<G> {
         state: AppState::Uninit {
@@ -80,6 +96,114 @@ where
 }
 
 type Builder<G> = Box<dyn FnMut(Arc<gpu::Context>) -> G>;
+
+/// MEGA_HEADLESS code path: builds the compute context + games + agent
+/// and drives `frames` physics substeps (one per iteration), without
+/// any window, surface, or render calls. Useful for trace generation
+/// on hosts that can't acquire a display (xvfb without DRI3, CI
+/// runners, headless Linux servers) — everything except rendering
+/// still happens, so the resulting `.pftrace` has CPU spans and
+/// meganeura GPU dispatches on the same tracks as a windowed run.
+fn run_headless<G, F>(config: AppConfig, mut build_game: F, frames: u32)
+where
+    G: Game + 'static,
+    F: FnMut(Arc<gpu::Context>) -> G + 'static,
+{
+    // Compute-only context — no presentation, no surface extensions.
+    let gpu = unsafe {
+        gpu::Context::init(gpu::ContextDesc {
+            presentation: false,
+            validation: cfg!(debug_assertions),
+            timing: true,
+            ..Default::default()
+        })
+    }
+    .expect("init Blade context (headless)");
+    let gpu = Arc::new(gpu);
+
+    let mut games: Vec<G> = (0..config.num_envs).map(|_| build_game(gpu.clone())).collect();
+    let spec = games[0].spec();
+
+    let mut agent = Agent::new(
+        gpu.clone(),
+        spec.obs_dim,
+        spec.num_actions,
+        config.num_envs,
+        config.agent.clone(),
+    );
+
+    let num_envs = games.len();
+    let obs_dim = spec.obs_dim;
+    let mut last_obs: Vec<Option<Vec<f32>>> = vec![None; num_envs];
+    let mut last_action: Vec<crate::agent::Action> = vec![0; num_envs];
+    let mut obs_buf = vec![0.0_f32; num_envs * obs_dim];
+
+    let start = Instant::now();
+    log::info!(
+        "mega-plays headless: {} frames × {} substeps × {} envs",
+        frames,
+        config.base_substeps_per_frame,
+        num_envs
+    );
+
+    for frame in 0..frames {
+        let _tick = tracing::info_span!("tick").entered();
+        let wall = start.elapsed().as_secs_f32();
+        for _ in 0..config.base_substeps_per_frame {
+            let _sub = tracing::info_span!("substep").entered();
+            for (i, g) in games.iter().enumerate() {
+                let o = g.observation();
+                obs_buf[i * obs_dim..(i + 1) * obs_dim].copy_from_slice(&o);
+            }
+            let actions = {
+                let _s = tracing::info_span!("select_actions").entered();
+                agent.select_actions(&obs_buf, wall)
+            };
+            {
+                let _physics = tracing::info_span!("physics").entered();
+                for (i, g) in games.iter_mut().enumerate() {
+                    let outcome = g.step(actions[i]);
+                    let next = g.observation();
+                    if let Some(prev) = last_obs[i].replace(next.clone()) {
+                        agent.record(Transition {
+                            obs: prev,
+                            action: last_action[i],
+                            reward: outcome.reward,
+                            next_obs: next,
+                            done: outcome.done,
+                        });
+                    }
+                    last_action[i] = actions[i];
+                    if outcome.done {
+                        g.reset();
+                        last_obs[i] = None;
+                    }
+                }
+            }
+        }
+        let _train = tracing::info_span!("train").entered();
+        for _ in 0..config.train_steps_per_frame {
+            let _s = tracing::info_span!("train_step").entered();
+            if agent.train_step().is_none() {
+                break;
+            }
+        }
+        if frame.is_multiple_of(500) {
+            log::info!(
+                "headless frame {} / {}  ({:.1}s elapsed, replay={})",
+                frame,
+                frames,
+                start.elapsed().as_secs_f32(),
+                agent.replay_len()
+            );
+        }
+    }
+    log::info!(
+        "headless done: {} frames in {:.2}s",
+        frames,
+        start.elapsed().as_secs_f32()
+    );
+}
 
 enum AppState<G: Game> {
     Uninit {
