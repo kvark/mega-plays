@@ -42,9 +42,9 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             agent: AgentConfig::default(),
-            num_envs: 16,
+            num_envs: 9,
             base_substeps_per_frame: 4,
-            train_steps_per_frame: 4,
+            train_steps_per_frame: 8,
             clear_color: Color32::from_rgb(8, 10, 14),
         }
     }
@@ -148,7 +148,7 @@ where
 
     for frame in 0..frames {
         let _tick = tracing::info_span!("tick").entered();
-        let wall = start.elapsed().as_secs_f32();
+        let _wall = start.elapsed().as_secs_f32();
         for _ in 0..config.base_substeps_per_frame {
             let _sub = tracing::info_span!("substep").entered();
             for (i, g) in games.iter().enumerate() {
@@ -157,7 +157,7 @@ where
             }
             let actions = {
                 let _s = tracing::info_span!("select_actions").entered();
-                agent.select_actions(&obs_buf, wall)
+                agent.select_actions(&obs_buf)
             };
             {
                 let _physics = tracing::info_span!("physics").entered();
@@ -220,7 +220,8 @@ struct App<G: Game> {
 
 impl<G: Game + 'static> winit::application::ApplicationHandler for App<G> {
     fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
-        let (mut build_game, config) = match std::mem::replace(&mut self.state, AppState::Dead) {
+        let (mut build_game, mut config) = match std::mem::replace(&mut self.state, AppState::Dead)
+        {
             AppState::Uninit { build_game, config } => (
                 build_game.expect("resumed called twice without a game builder"),
                 config,
@@ -241,6 +242,16 @@ impl<G: Game + 'static> winit::application::ApplicationHandler for App<G> {
         }
         .expect("init Blade context");
         let gpu = Arc::new(gpu);
+
+        // Allow overriding the number of parallel environments at
+        // launch via MEGAPLAYS_NUM_ENVS=<n>. Useful for quick
+        // experiments without recompiling.
+        if let Some(n) = std::env::var("MEGAPLAYS_NUM_ENVS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+        {
+            config.num_envs = n.max(1);
+        }
 
         let games: Vec<G> = (0..config.num_envs)
             .map(|_| build_game(gpu.clone()))
@@ -287,6 +298,7 @@ impl<G: Game + 'static> winit::application::ApplicationHandler for App<G> {
         };
 
         let now = Instant::now();
+        let initial_num_envs = config.num_envs as u32;
         self.state = AppState::Running(Box::new(Running {
             gpu,
             surface,
@@ -312,6 +324,12 @@ impl<G: Game + 'static> winit::application::ApplicationHandler for App<G> {
             scores_agent: 0,
             scores_opp: 0,
             action_hist: [0; 8],
+            loss_ema: 0.0,
+            return_ema: 0.0,
+            pending_num_envs: initial_num_envs,
+            auto_difficulty: true,
+            target_win_ratio: 1.5,
+            win_rate_ema: 0.6, // = 1.5 / 2.5, matches the default target
             start_time: now,
             last_frame: now,
             physics_accum: 0.0,
@@ -322,6 +340,13 @@ impl<G: Game + 'static> winit::application::ApplicationHandler for App<G> {
             exit_deadline,
             frame_counter: 0,
             last_heartbeat: 0.0,
+            last_heartbeat_frame: 0,
+            epoch_remaining: 0,
+            epoch_total: 0,
+            render_prims: 0,
+            render_verts: 0,
+            status_msg: String::new(),
+            status_time: now,
         }));
     }
 
@@ -369,6 +394,9 @@ impl<G: Game + 'static> winit::application::ApplicationHandler for App<G> {
                 KeyCode::KeyG => r.show_overlay = !r.show_overlay,
                 KeyCode::KeyV => r.view_mode = r.view_mode.toggled(),
                 KeyCode::KeyR => r.reset_learning(),
+                KeyCode::KeyT => r.train_epoch(),
+                KeyCode::KeyS => r.save_weights(),
+                KeyCode::KeyL => r.load_weights(),
                 _ => {}
             },
             WindowEvent::RedrawRequested => r.redraw(event_loop),
@@ -418,18 +446,50 @@ struct Running<G: Game> {
     last_frame: Instant,
     physics_accum: f32,
 
+    /// Exponential moving average of training loss (α = 0.01).
+    loss_ema: f32,
+    /// Exponential moving average of episode return (α = 0.02).
+    return_ema: f32,
+
+    /// Editable in the UI; applied on the next reset.
+    pending_num_envs: u32,
+
     paused: bool,
     show_overlay: bool,
     view_mode: ViewMode,
     /// Speed multiplier from the UI slider. Total substeps per frame
     /// is `base_substeps_per_frame * speed_mul`.
-    speed_mul: u32,
+    speed_mul: i32,
+
+    /// Auto-curriculum: adjust game difficulty to maintain a target
+    /// win/loss ratio. When enabled, the controller nudges
+    /// `Game::set_difficulty` after every episode.
+    auto_difficulty: bool,
+    /// Target win/loss ratio for auto-curriculum (e.g. 1.5 = agent
+    /// wins 60% of episodes).
+    target_win_ratio: f32,
+    /// EMA of the agent's win rate (0.0–1.0), α = 0.02.
+    win_rate_ema: f32,
 
     /// If set (via `MEGAPLAYS_EXIT_AFTER_SECS`), self-exit once wall
     /// time exceeds this many seconds. Used for headless smoke tests.
     exit_deadline: Option<f32>,
     frame_counter: u64,
     last_heartbeat: f32,
+    last_heartbeat_frame: u64,
+
+    /// Remaining frames in the current training epoch. When > 0 each
+    /// redraw processes a chunk and shows a progress bar.
+    epoch_remaining: u32,
+    epoch_total: u32,
+
+    /// Per-frame render timing (updated every frame, logged at heartbeat).
+    render_prims: usize,
+    render_verts: usize,
+
+    /// Brief status message shown in the UI, fades after a few seconds.
+    status_msg: String,
+    status_time: Instant,
 }
 
 fn make_surface_config(size: winit::dpi::PhysicalSize<u32>) -> gpu::SurfaceConfig {
@@ -455,24 +515,32 @@ impl<G: Game> Running<G> {
     }
 
     fn reset_learning(&mut self) {
+        // Apply pending num_envs change.
+        let new_num_envs = (self.pending_num_envs as usize).max(1);
+        self.config.num_envs = new_num_envs;
+
         let cfg = self.config.agent.clone();
-        let num_envs = self.config.num_envs;
         self.agent = Agent::new(
             self.gpu.clone(),
             self.spec.obs_dim,
             self.spec.num_actions,
-            num_envs,
+            new_num_envs,
             cfg,
         );
         self.loss_hist = RollingStats::new(400);
         self.reward_hist = RollingStats::new(400);
         self.episode_return_hist = RollingStats::new(200);
-        self.episode_return.iter_mut().for_each(|r| *r = 0.0);
+        self.loss_ema = 0.0;
+        self.return_ema = 0.0;
+        self.scores_agent = 0;
+        self.scores_opp = 0;
+        self.win_rate_ema = self.target_win_ratio / (1.0 + self.target_win_ratio);
+
+        // Rebuild the game vector to match the new env count.
         if let Some(build) = self.build_game.as_mut() {
-            for g in &mut self.games {
-                *g = build(self.gpu.clone());
-            }
+            self.games = (0..new_num_envs).map(|_| build(self.gpu.clone())).collect();
         } else {
+            self.games.resize_with(new_num_envs, || unreachable!());
             for g in &mut self.games {
                 g.reset();
             }
@@ -494,6 +562,155 @@ impl<G: Game> Running<G> {
             .map_or(0, |(i, _)| i)
     }
 
+    /// Start a training epoch: 10 000 headless frames processed in
+    /// chunks across multiple redraws so the UI stays responsive.
+    fn train_epoch(&mut self) {
+        const EPOCH_FRAMES: u32 = 10_000;
+        if self.epoch_remaining > 0 {
+            return; // already in progress
+        }
+        self.epoch_remaining = EPOCH_FRAMES;
+        self.epoch_total = EPOCH_FRAMES;
+    }
+
+    /// Process a chunk of the current training epoch. Called each
+    /// redraw while `epoch_remaining > 0`. Returns `true` while work
+    /// remains.
+    fn train_epoch_chunk(&mut self) -> bool {
+        if self.epoch_remaining == 0 {
+            return false;
+        }
+
+        let obs_dim = self.spec.obs_dim;
+        let num_envs = self.games.len();
+        let mut obs_buf = vec![0.0_f32; num_envs * obs_dim];
+
+        if self.last_obs.len() != num_envs {
+            self.last_obs = vec![None; num_envs];
+            self.last_action = vec![0; num_envs];
+            self.episode_return = vec![0.0; num_envs];
+            self.episode_len = vec![0; num_envs];
+        }
+
+        // Process a small chunk per redraw to keep the UI responsive.
+        // Each frame does `substeps` inference passes + `train_steps`
+        // gradient steps, so even 10 frames can take tens of ms.
+        let substeps = self.config.base_substeps_per_frame;
+        let train_steps = self.config.train_steps_per_frame;
+        let chunk = self.epoch_remaining.min(10);
+        for _ in 0..chunk {
+            for _ in 0..substeps {
+                for (i, g) in self.games.iter().enumerate() {
+                    let o = g.observation();
+                    obs_buf[i * obs_dim..(i + 1) * obs_dim].copy_from_slice(&o);
+                }
+                let actions = self.agent.select_actions(&obs_buf);
+                for (i, g) in self.games.iter_mut().enumerate() {
+                    let outcome = g.step(actions[i]);
+                    let next = g.observation();
+                    self.episode_return[i] += outcome.reward;
+                    self.episode_len[i] += 1;
+                    if let Some(prev) = self.last_obs[i].replace(next.clone()) {
+                        self.agent.record(Transition {
+                            obs: prev,
+                            action: self.last_action[i],
+                            reward: outcome.reward,
+                            next_obs: next,
+                            done: outcome.done,
+                        });
+                    }
+                    self.last_action[i] = actions[i];
+                    if outcome.done {
+                        if outcome.terminal_reward > 0.0 {
+                            self.scores_agent += 1;
+                        } else if outcome.terminal_reward < 0.0 {
+                            self.scores_opp += 1;
+                        }
+                        self.win_rate_ema = ema(
+                            self.win_rate_ema,
+                            if outcome.terminal_reward > 0.0 {
+                                1.0
+                            } else {
+                                0.0
+                            },
+                            0.02,
+                        );
+                        self.episode_return_hist.push(self.episode_return[i]);
+                        self.return_ema = ema(self.return_ema, self.episode_return[i], 0.02);
+                        self.episode_return[i] = 0.0;
+                        self.episode_len[i] = 0;
+                        g.reset();
+                        self.last_obs[i] = None;
+                    }
+                }
+            }
+            for _ in 0..train_steps {
+                if let Some(loss) = self.agent.train_step() {
+                    self.loss_hist.push(loss);
+                    self.loss_ema = ema(self.loss_ema, loss, 0.01);
+                } else {
+                    break;
+                }
+            }
+        }
+        self.epoch_remaining -= chunk;
+
+        if self.epoch_remaining == 0 {
+            log::info!(
+                "train epoch done: grad={} eps={:.3} replay={}",
+                self.agent.gradient_steps,
+                self.agent.current_epsilon(),
+                self.agent.replay_len(),
+            );
+        }
+        self.epoch_remaining > 0
+    }
+
+    fn weights_path(&self) -> std::path::PathBuf {
+        std::path::PathBuf::from(format!("{}.weights", self.spec.title))
+    }
+
+    fn set_status(&mut self, msg: String) {
+        self.status_msg = msg;
+        self.status_time = Instant::now();
+    }
+
+    fn save_weights(&mut self) {
+        let path = self.weights_path();
+        match self.agent.save_weights(&path) {
+            Ok(()) => {
+                let msg = format!("saved to {}", path.display());
+                log::info!("{msg}");
+                self.set_status(msg);
+            }
+            Err(e) => {
+                let msg = format!("save failed: {e}");
+                log::error!("{msg}");
+                self.set_status(msg);
+            }
+        }
+    }
+
+    fn load_weights(&mut self) {
+        let path = self.weights_path();
+        match self.agent.load_weights(&path) {
+            Ok(()) => {
+                let msg = format!(
+                    "loaded from {} (eps={:.3})",
+                    path.display(),
+                    self.agent.current_epsilon(),
+                );
+                log::info!("{msg}");
+                self.set_status(msg);
+            }
+            Err(e) => {
+                let msg = format!("load failed: {e}");
+                log::error!("{msg}");
+                self.set_status(msg);
+            }
+        }
+    }
+
     fn tick(&mut self) {
         let _tick = tracing::info_span!("tick").entered();
         if self.last_obs.len() != self.games.len() {
@@ -507,7 +724,6 @@ impl<G: Game> Running<G> {
             return;
         }
 
-        let wall = self.start_time.elapsed().as_secs_f32();
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f32().min(0.1);
         self.last_frame = now;
@@ -516,7 +732,8 @@ impl<G: Game> Running<G> {
         // Number of substeps this frame: base * slider, but capped by
         // how much wall-clock dt has actually accumulated so the
         // display doesn't lie about the simulation rate.
-        let total_subs = (self.config.base_substeps_per_frame * self.speed_mul).max(1);
+        let total_subs =
+            (self.config.base_substeps_per_frame as i32 * self.speed_mul).max(1) as u32;
         let obs_dim = self.spec.obs_dim;
         let num_envs = self.games.len();
         let mut obs_buf = vec![0.0_f32; num_envs * obs_dim];
@@ -529,7 +746,7 @@ impl<G: Game> Running<G> {
             }
             let actions = {
                 let _s = tracing::info_span!("select_actions").entered();
-                self.agent.select_actions(&obs_buf, wall)
+                self.agent.select_actions(&obs_buf)
             };
 
             let _physics = tracing::info_span!("physics").entered();
@@ -554,12 +771,17 @@ impl<G: Game> Running<G> {
                 self.reward_hist.push(outcome.reward);
 
                 if outcome.done {
-                    if outcome.terminal_reward > 0.0 {
+                    let agent_won = outcome.terminal_reward > 0.0;
+                    if agent_won {
                         self.scores_agent += 1;
                     } else if outcome.terminal_reward < 0.0 {
                         self.scores_opp += 1;
                     }
-                    self.episode_return_hist.push(self.episode_return[i]);
+                    self.win_rate_ema =
+                        ema(self.win_rate_ema, if agent_won { 1.0 } else { 0.0 }, 0.02);
+                    let ret = self.episode_return[i];
+                    self.episode_return_hist.push(ret);
+                    self.return_ema = ema(self.return_ema, ret, 0.02);
                     self.episode_len_hist.push(self.episode_len[i] as f32);
                     self.episode_return[i] = 0.0;
                     self.episode_len[i] = 0;
@@ -570,13 +792,36 @@ impl<G: Game> Running<G> {
             self.physics_accum = (self.physics_accum - self.spec.physics_dt).max(0.0);
         }
 
+        // Auto-curriculum: increase difficulty when the agent is
+        // winning too much. One-directional ratchet — never reduces
+        // difficulty below the starting value, so early random play
+        // doesn't collapse the opponent to trivial.
+        let total_episodes = self.scores_agent + self.scores_opp;
+        if self.auto_difficulty && total_episodes >= 50 {
+            let actual_wr = self.scores_agent as f32 / total_episodes as f32;
+            let target_wr = self.target_win_ratio / (1.0 + self.target_win_ratio);
+            if actual_wr > target_wr {
+                let excess = actual_wr - target_wr;
+                let rate = excess * 0.12 * dt;
+                let adj = (1.0 + rate).clamp(1.0, 1.005);
+                let d = self.games[0].difficulty();
+                let new_d = (d * adj).min(3.0);
+                for g in &mut self.games {
+                    g.set_difficulty(new_d);
+                }
+            }
+        }
+
         let _train = tracing::info_span!("train").entered();
-        for _ in 0..self.config.train_steps_per_frame {
+        let train_steps =
+            self.config.train_steps_per_frame * total_subs / self.config.base_substeps_per_frame;
+        for _ in 0..train_steps {
             if let Some(loss) = {
                 let _s = tracing::info_span!("train_step").entered();
                 self.agent.train_step()
             } {
                 self.loss_hist.push(loss);
+                self.loss_ema = ema(self.loss_ema, loss, 0.01);
             } else {
                 break;
             }
@@ -585,11 +830,21 @@ impl<G: Game> Running<G> {
 
     fn redraw(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
         self.tick();
+        self.train_epoch_chunk();
         self.frame_counter += 1;
 
         let wall = self.start_time.elapsed().as_secs_f32();
         if wall - self.last_heartbeat > 2.0 {
+            let interval_frames = self.frame_counter - self.last_heartbeat_frame;
+            let interval_secs = wall - self.last_heartbeat;
+            let interval_fps = interval_frames as f32 / interval_secs;
+            let frame_ms = if interval_frames > 0 {
+                interval_secs * 1000.0 / interval_frames as f32
+            } else {
+                0.0
+            };
             self.last_heartbeat = wall;
+            self.last_heartbeat_frame = self.frame_counter;
             let total = self.scores_agent + self.scores_opp;
             let win_rate = if total > 0 {
                 self.scores_agent as f32 / total as f32
@@ -613,12 +868,26 @@ impl<G: Game> Running<G> {
                 let _ = write!(action_str, "{frac:.2}");
             }
             action_str.push(']');
+            let galleys = self
+                .egui_winit
+                .egui_ctx()
+                .fonts(|f| f.num_galleys_in_cache());
+            let atlas_fill = self
+                .egui_winit
+                .egui_ctx()
+                .fonts(|f| f.font_atlas_fill_ratio());
             log::info!(
-                "t={:5.1}s fps={:5.1} eps={:.3} grad={:>5} loss={:.4} \
+                "t={:5.1}s fps={:5.1} ({:.1}ms) prims={} verts={} galleys={} atlas={:.0}% \
+                 eps={:.3} grad={:>5} loss={:.4} \
                  ret={:6.2} len={:6.1} wins={}/{} ({:.1}%) actions={}",
                 wall,
-                self.frame_counter as f32 / wall,
-                self.agent.current_epsilon(wall),
+                interval_fps,
+                frame_ms,
+                self.render_prims,
+                self.render_verts,
+                galleys,
+                atlas_fill * 100.0,
+                self.agent.current_epsilon(),
                 self.agent.gradient_steps,
                 self.agent.last_loss,
                 self.episode_return_hist.mean(),
@@ -657,7 +926,7 @@ impl<G: Game> Running<G> {
             .egui_winit
             .egui_ctx()
             .clone()
-            .run(raw_input, |ctx| self.build_ui(ctx, event_loop));
+            .run_ui(raw_input, |ctx| self.build_ui(ctx, event_loop));
 
         self.egui_winit
             .handle_platform_output(&self.window, egui_output.platform_output);
@@ -671,13 +940,37 @@ impl<G: Game> Running<G> {
             scale_factor: pixels_per_point,
         };
 
+        self.render_prims = primitives.len();
+        self.render_verts = primitives
+            .iter()
+            .map(|p| match &p.primitive {
+                egui::epaint::Primitive::Mesh(m) => m.vertices.len(),
+                _ => 0,
+            })
+            .sum();
+
+        let t_render = Instant::now();
         self.render(&primitives, &egui_output.textures_delta, &screen_desc);
+        let render_ms = t_render.elapsed().as_secs_f32() * 1000.0;
+        if render_ms > 20.0 {
+            log::warn!(
+                "slow render: {render_ms:.1}ms prims={} verts={} tex_set={} tex_free={} galleys={}",
+                self.render_prims,
+                self.render_verts,
+                egui_output.textures_delta.set.len(),
+                egui_output.textures_delta.free.len(),
+                self.egui_winit
+                    .egui_ctx()
+                    .fonts(|f| f.num_galleys_in_cache()),
+            );
+        }
     }
 
     fn build_ui(&mut self, ctx: &egui::Context, event_loop: &winit::event_loop::ActiveEventLoop) {
         let clear = self.config.clear_color;
         let play_aspect = self.spec.play_area[0] / self.spec.play_area[1];
         let view_mode = self.view_mode;
+        #[allow(deprecated)]
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::default()
@@ -715,21 +1008,27 @@ impl<G: Game> Running<G> {
                     }
                     ViewMode::Overlay => {
                         // Super-Meat-Boy-style: every env in the same
-                        // rect. The "hero" env (longest current episode
-                        // — proxy for best live performer) paints last
-                        // at full opacity; the rest are alpha-blended
-                        // ghosts, so the active attempt stands out
-                        // against a cloud of parallel runs.
+                        // rect. The hero (longest current episode) draws
+                        // first so its opaque backdrop goes down, then
+                        // the alpha-blended ghosts layer on top, and
+                        // finally the hero's entities re-paint at full
+                        // opacity so the current best attempt clearly
+                        // stands out against the ghost cloud.
                         let play = fit_rect(rect, play_aspect);
                         let hero = self.hero_env();
                         let ghost_alpha = ghost_alpha_for(self.games.len());
+                        // Hero backdrop first (opaque, sets the scene).
+                        self.games[hero].paint(painter, play, 255);
+                        // Ghosts on top of the backdrop.
                         for (i, g) in self.games.iter().enumerate() {
                             if i == hero {
                                 continue;
                             }
                             g.paint(painter, play, ghost_alpha);
                         }
-                        self.games[hero].paint(painter, play, 255);
+                        // Re-paint the hero's entities so they sit on
+                        // top of the ghost cloud, fully opaque.
+                        self.games[hero].paint(painter, play, 254);
                         painter.rect_stroke(
                             play,
                             0.0,
@@ -750,11 +1049,24 @@ impl<G: Game> Running<G> {
             .collapsible(true)
             .show(ctx, |ui| {
                 let wall = self.start_time.elapsed().as_secs_f32();
-                ui.label(format!("envs            {}", self.games.len()));
+
+                // Editable env count + reset on one line.
+                ui.horizontal(|ui| {
+                    ui.label("envs");
+                    ui.add(
+                        egui::DragValue::new(&mut self.pending_num_envs)
+                            .range(1..=256)
+                            .speed(0.2),
+                    );
+                    if ui.button("reset [R]").clicked() {
+                        self.reset_learning();
+                    }
+                });
+
                 ui.label(format!("wall time       {:7.1} s", wall));
                 ui.label(format!(
                     "epsilon         {:7.3}",
-                    self.agent.current_epsilon(wall)
+                    self.agent.current_epsilon()
                 ));
                 ui.label(format!(
                     "replay / cap    {:>6} / {}",
@@ -763,13 +1075,6 @@ impl<G: Game> Running<G> {
                 ));
                 ui.label(format!("grad steps      {:>7}", self.agent.gradient_steps));
                 ui.label(format!("inferences      {:>7}", self.agent.inferences));
-                ui.label(format!("last loss       {:>7.4}", self.agent.last_loss));
-                if !self.episode_return_hist.is_empty() {
-                    ui.label(format!(
-                        "mean return     {:>7.2}",
-                        self.episode_return_hist.mean()
-                    ));
-                }
 
                 ui.separator();
                 ui.add(
@@ -792,9 +1097,47 @@ impl<G: Game> Running<G> {
                 {
                     self.paused = !self.paused;
                 }
+                if self.epoch_remaining > 0 {
+                    let done = self.epoch_total - self.epoch_remaining;
+                    let frac = done as f32 / self.epoch_total as f32;
+                    ui.add(
+                        egui::ProgressBar::new(frac)
+                            .text(format!("training {}/{}", done, self.epoch_total,))
+                            .desired_width(260.0),
+                    );
+                } else if ui
+                    .button("train epoch [T]")
+                    .on_hover_text("Run 10 000 headless train steps (skips rendering)")
+                    .clicked()
+                {
+                    self.train_epoch();
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("save [S]").clicked() {
+                        self.save_weights();
+                    }
+                    if ui.button("load [L]").clicked() {
+                        self.load_weights();
+                    }
+                });
+                // Show status message for 3 seconds after save/load.
+                if !self.status_msg.is_empty() && self.status_time.elapsed().as_secs_f32() < 3.0 {
+                    ui.label(
+                        egui::RichText::new(&self.status_msg)
+                            .small()
+                            .color(Color32::from_rgb(180, 200, 140)),
+                    );
+                }
 
                 ui.separator();
-                ui.label("training loss");
+                ui.horizontal(|ui| {
+                    ui.label("training loss");
+                    ui.label(
+                        egui::RichText::new(format!("{:.4}", self.loss_ema))
+                            .strong()
+                            .color(Color32::from_rgb(220, 90, 80)),
+                    );
+                });
                 let (loss_rect, _) =
                     ui.allocate_exact_size(Vec2::new(260.0, 80.0), egui::Sense::hover());
                 draw_plot(
@@ -805,7 +1148,14 @@ impl<G: Game> Running<G> {
                     true,
                 );
 
-                ui.label("episode return (200)");
+                ui.horizontal(|ui| {
+                    ui.label("episode return");
+                    ui.label(
+                        egui::RichText::new(format!("{:.2}", self.return_ema))
+                            .strong()
+                            .color(Color32::from_rgb(80, 220, 120)),
+                    );
+                });
                 let (ret_rect, _) =
                     ui.allocate_exact_size(Vec2::new(260.0, 60.0), egui::Sense::hover());
                 draw_plot(
@@ -828,11 +1178,38 @@ impl<G: Game> Running<G> {
 
                 ui.separator();
                 self.games[0].ui(ui);
+                // Propagate slider changes from game[0] to all others.
+                for i in 1..self.games.len() {
+                    let (head, tail) = self.games.split_at_mut(i);
+                    tail[0].sync_settings(&head[0]);
+                }
 
                 ui.separator();
-                if ui.button("reset [R]").clicked() {
-                    self.reset_learning();
+                ui.checkbox(&mut self.auto_difficulty, "auto difficulty");
+                if self.auto_difficulty {
+                    ui.horizontal(|ui| {
+                        ui.label("target W/L");
+                        ui.add(
+                            egui::DragValue::new(&mut self.target_win_ratio)
+                                .range(1.0..=5.0)
+                                .speed(0.05)
+                                .fixed_decimals(1),
+                        );
+                    });
                 }
+                let total = self.scores_agent + self.scores_opp;
+                let wr = if total > 0 {
+                    self.scores_agent as f32 / total as f32
+                } else {
+                    0.0
+                };
+                ui.label(format!(
+                    "win rate        {:>5.1}%  difficulty {:.2}",
+                    wr * 100.0,
+                    self.games[0].difficulty(),
+                ));
+
+                ui.separator();
                 if ui.button("quit [Esc]").clicked() {
                     event_loop.exit();
                 }
@@ -909,6 +1286,12 @@ impl<G: Game> Running<G> {
         if let Some(sp) = self.prev_sync_point.take() {
             let _ = self.gpu.wait_for(&sp, !0);
         }
+        // Drop the agent (and its meganeura sessions) first — each
+        // session's Drop waits for its in-flight GPU work and then
+        // destroys its pipelines and buffers. This must happen before
+        // we tear down the render resources below, otherwise Vulkan
+        // validation complains about objects destroyed out of order.
+        self.agent.destroy();
         self.gpu.destroy_command_encoder(&mut self.command_encoder);
         self.gui_painter.destroy(&self.gpu);
         self.gpu.destroy_surface(&mut self.surface);
@@ -947,10 +1330,16 @@ impl ViewMode {
 /// overlapping ghosts read as a softly-saturated cloud without
 /// drowning out the hero.
 fn ghost_alpha_for(n_envs: usize) -> u8 {
-    // Inverse proportional to sqrt(N) with a reasonable floor — 4
-    // envs read at ~80, 16 envs read at ~40, 64 envs read at ~20.
+    // Inverse proportional to sqrt(N) with a generous floor so
+    // ghosts stay visible even with many envs — 4 envs ≈ 120,
+    // 16 envs ≈ 60, 64 envs ≈ 40.
     let n = (n_envs as f32).max(1.0);
-    ((160.0 / n.sqrt()).clamp(16.0, 200.0)) as u8
+    ((240.0 / n.sqrt()).clamp(40.0, 200.0)) as u8
+}
+
+/// Exponential moving average: `current ← (1-α) * current + α * sample`.
+fn ema(current: f32, sample: f32, alpha: f32) -> f32 {
+    current * (1.0 - alpha) + sample * alpha
 }
 
 fn fit_rect(avail: Rect, aspect: f32) -> Rect {

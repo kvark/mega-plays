@@ -86,4 +86,21 @@ pub trait Game {
     /// Game-specific panel contents (scores, mode toggles, etc.).
     /// Called once per frame inside the stats window.
     fn ui(&mut self, _ui: &mut egui::Ui) {}
+
+    /// Copy user-tunable settings (sliders, toggles) from `source`
+    /// into `self` without touching game state (positions, scores,
+    /// etc.). Called by the driver to propagate UI changes from
+    /// game\[0\] to all other environments.
+    fn sync_settings(&mut self, _source: &Self) {}
+
+    /// Current difficulty level. The driver reads this to display in
+    /// the training panel and to feed the auto-curriculum controller.
+    fn difficulty(&self) -> f32 {
+        0.0
+    }
+
+    /// Set the difficulty level. Interpretation is game-specific —
+    /// e.g. opponent speed for Pong. Called by the auto-curriculum
+    /// controller and propagated to all environments.
+    fn set_difficulty(&mut self, _level: f32) {}
 }

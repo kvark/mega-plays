@@ -46,3 +46,6 @@ jobs:
 
       - name: Unit tests
         run: cargo test --workspace --lib
+
+      - name: Headless smoke test
+        run: cargo test --release --test headless -- --test-threads=1

@@ -47,12 +47,12 @@ pub const OPPONENT_SPEED_FRACTION: f32 = 0.25;
 /// Bellman loss against an otherwise-zero batch of non-terminal
 /// transitions. DQN learning speed on small networks is very
 /// sensitive to this.
-pub const TERMINAL_REWARD: f32 = 10.0;
+pub const TERMINAL_REWARD: f32 = 1.0;
 
 /// Small dense reward for aligning the agent paddle with the ball.
 /// Provides a non-terminal gradient signal so the policy has something
 /// to optimise before the first terminal reward lands in replay.
-pub const SHAPING_WEIGHT: f32 = 0.05;
+pub const SHAPING_WEIGHT: f32 = 0.1;
 
 pub struct PongGame {
     agent_y: f32,
@@ -64,6 +64,8 @@ pub struct PongGame {
     opponent_noise: f32,
     opponent_speed_frac: f32,
     shaping_weight: f32,
+    /// Previous paddle–ball distance for potential-based shaping.
+    prev_dist: f32,
     rng: rand::rngs::ThreadRng,
 }
 
@@ -79,10 +81,19 @@ impl PongGame {
             opponent_noise: 0.08,
             opponent_speed_frac: OPPONENT_SPEED_FRACTION,
             shaping_weight: SHAPING_WEIGHT,
+            prev_dist: 0.0,
             rng: rand::rng(),
         };
         g.reset_ball(true);
         g
+    }
+
+    pub fn score_agent(&self) -> u32 {
+        self.score_agent
+    }
+
+    pub fn score_opponent(&self) -> u32 {
+        self.score_opponent
     }
 
     fn reset_ball(&mut self, toward_agent: bool) {
@@ -106,10 +117,13 @@ impl PongGame {
 
     fn update_opponent(&mut self, dt: f32) {
         use rand::Rng;
-        let target = self.ball.y
-            + self
-                .rng
-                .random_range(-self.opponent_noise..self.opponent_noise);
+        let noise = if self.opponent_noise > 0.0 {
+            self.rng
+                .random_range(-self.opponent_noise..self.opponent_noise)
+        } else {
+            0.0
+        };
+        let target = self.ball.y + noise;
         let diff = target - self.opponent_y;
         let max_step = PADDLE_SPEED * self.opponent_speed_frac * dt;
         let step = diff.clamp(-max_step, max_step);
@@ -198,12 +212,13 @@ impl Game for PongGame {
         self.agent_y = Self::move_paddle(self.agent_y, action, dt);
         self.update_opponent(dt);
         let (terminal_r, done) = self.collide(dt);
-        // Dense shaping: small negative reward proportional to paddle /
-        // ball y-misalignment. Pushes the agent to track the ball even
-        // while epsilon-greedy random actions dominate the replay
-        // buffer. Zero weight disables it.
-        let alignment = (self.ball.y - self.agent_y).abs() / (PLAY_HEIGHT * 0.5);
-        let shaping = -self.shaping_weight * alignment;
+        // Potential-based shaping: reward the *change* in paddle–ball
+        // distance. Moving closer → positive, drifting away → negative.
+        // This is provably policy-invariant (doesn't alter the optimal
+        // policy) while giving dense gradient signal.
+        let dist = (self.ball.y - self.agent_y).abs() / (PLAY_HEIGHT * 0.5);
+        let shaping = self.shaping_weight * (self.prev_dist - dist);
+        self.prev_dist = dist;
         StepOutcome {
             reward: terminal_r + shaping,
             done,
@@ -250,22 +265,34 @@ impl Game for PongGame {
             }
         }
 
-        let paddle_color = crate::tint(Color32::from_rgb(220, 225, 235), alpha);
-        let paddle = |painter: &Painter, x: f32, paddle_y: f32| {
+        // Agent paddle: slight blue tint. Opponent: slight orange tint.
+        let agent_color = crate::tint(Color32::from_rgb(160, 200, 255), alpha);
+        let opp_color = crate::tint(Color32::from_rgb(255, 190, 140), alpha);
+        let draw_paddle = |painter: &Painter, x: f32, paddle_y: f32, color: Color32| {
             let tl = to_screen(Pos2::new(x - PADDLE_WIDTH, paddle_y + PADDLE_HEIGHT * 0.5));
             let br = to_screen(Pos2::new(x + PADDLE_WIDTH, paddle_y - PADDLE_HEIGHT * 0.5));
             let r = Rect::from_two_pos(tl, br);
-            painter.rect_filled(r, CornerRadius::ZERO, paddle_color);
+            painter.rect_filled(r, CornerRadius::ZERO, color);
         };
-        paddle(painter, -PLAY_WIDTH * 0.5 + PADDLE_WIDTH, self.agent_y);
-        paddle(painter, PLAY_WIDTH * 0.5 - PADDLE_WIDTH, self.opponent_y);
+        draw_paddle(
+            painter,
+            -PLAY_WIDTH * 0.5 + PADDLE_WIDTH,
+            self.agent_y,
+            agent_color,
+        );
+        draw_paddle(
+            painter,
+            PLAY_WIDTH * 0.5 - PADDLE_WIDTH,
+            self.opponent_y,
+            opp_color,
+        );
 
         // Ball.
         let ball_screen = to_screen(self.ball);
         painter.rect_filled(
             Rect::from_center_size(ball_screen, Vec2::splat(BALL_RADIUS * 2.0 * sx.min(sy))),
             CornerRadius::ZERO,
-            paddle_color,
+            crate::tint(Color32::from_rgb(220, 225, 235), alpha),
         );
 
         // Score — suppress in ghost passes so 16 overlapping score
@@ -295,7 +322,21 @@ impl Game for PongGame {
             self.score_agent, self.score_opponent
         ));
         ui.add(egui::Slider::new(&mut self.opponent_noise, 0.0..=0.3).text("opponent noise"));
-        ui.add(egui::Slider::new(&mut self.opponent_speed_frac, 0.2..=1.2).text("opponent speed"));
+        ui.add(egui::Slider::new(&mut self.opponent_speed_frac, 0.0..=3.0).text("opponent speed"));
         ui.add(egui::Slider::new(&mut self.shaping_weight, 0.0..=0.1).text("shaping reward"));
+    }
+
+    fn sync_settings(&mut self, source: &Self) {
+        self.opponent_noise = source.opponent_noise;
+        self.opponent_speed_frac = source.opponent_speed_frac;
+        self.shaping_weight = source.shaping_weight;
+    }
+
+    fn difficulty(&self) -> f32 {
+        self.opponent_speed_frac
+    }
+
+    fn set_difficulty(&mut self, level: f32) {
+        self.opponent_speed_frac = level.clamp(0.0, 3.0);
     }
 }

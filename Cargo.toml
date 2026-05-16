@@ -17,14 +17,13 @@ name = "lander"
 path = "src/bin/lander.rs"
 
 [dependencies]
-# Pinned exactly to meganeura 0.2.0's blade-graphics dep. Bumping either
-# side requires bumping both in lockstep, or the session and the renderer
-# will silently link two copies of the GPU context type.
-blade-graphics = "=0.8.2"
-blade-egui = "0.8"
+# Blade and Meganeura must use the same blade-graphics version. Both are
+# pinned by rev to avoid linking two copies of the GPU context type.
+blade-graphics = { git = "https://github.com/kvark/blade", rev = "72c30c1"}
+blade-egui = { git = "https://github.com/kvark/blade", rev = "72c30c1"}
 blade-macros = "0.3"
-egui = "0.33"
-egui-winit = { version = "0.33", default-features = false }
+egui = "0.34"
+egui-winit = { version = "0.34", default-features = false }
 winit = "0.30"
 bytemuck = { version = "1", features = ["derive"] }
 log = "0.4"
@@ -35,11 +34,7 @@ rand = "0.9"
 # spans that meganeura's profiler captures onto the Perfetto track.
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 
-# Meganeura is consumed as a normal git dependency pinned by SHA. Bump
-# this pin together with the `blade-graphics = "=0.8.2"` pin above if
-# meganeura changes its blade version — see the lockstep-versioning
-# note in the README.
-meganeura = { git = "https://github.com/kvark/meganeura", rev = "33dcf42aa10ec1d8146298bbf40e8f609fb9bd17" }
+meganeura = { git = "https://github.com/kvark/meganeura", rev = "d511c61" }
 
 [profile.release]
 lto = "thin"

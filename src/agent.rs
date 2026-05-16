@@ -1,5 +1,5 @@
-//! DQN agent: MLP policy, experience replay, target network, vectorised
-//! inference.
+//! Double-DQN agent: MLP policy, experience replay, target network,
+//! vectorised inference.
 //!
 //! Design notes:
 //!
@@ -12,6 +12,14 @@
 //!   into the inference session. That round trip is negligible for
 //!   the ~few-thousand-parameter MLPs used here; when networks grow,
 //!   a GPU-side weight copy becomes worth the effort.
+//!
+//! - The target network is a CPU-side snapshot of the training
+//!   weights. Double DQN: the online network selects the best action,
+//!   the target network evaluates it. This eliminates the
+//!   overestimation bias of standard DQN.
+//!
+//! - Epsilon decays by gradient steps, not wall clock, so training
+//!   progress is deterministic regardless of frame rate.
 //!
 //! - Transitions live in a plain `VecDeque<Transition>`. No lock-free
 //!   queue — the driver is single-threaded for the initial iteration.
@@ -43,6 +51,7 @@ pub struct Transition {
 /// Pong — not a general-purpose RL configuration.
 #[derive(Clone, Debug)]
 pub struct AgentConfig {
+    /// Width of each hidden layer: `obs → hidden → hidden → actions`.
     pub hidden: usize,
     pub replay_capacity: usize,
     pub batch_size: usize,
@@ -50,10 +59,11 @@ pub struct AgentConfig {
     pub learning_rate: f32,
     pub epsilon_start: f32,
     pub epsilon_end: f32,
-    /// Wall-clock seconds over which epsilon linearly decays.
-    pub epsilon_decay_secs: f32,
-    /// Gradient steps between target-network hard copies.
-    pub target_sync_interval: u32,
+    /// Gradient steps over which epsilon linearly decays.
+    pub epsilon_decay_steps: u64,
+    /// Polyak averaging factor for soft target-network updates.
+    /// `target ← (1-τ) * target + τ * online` after each gradient step.
+    pub target_tau: f32,
     /// Minimum transitions in the buffer before training starts.
     pub warmup: usize,
 }
@@ -63,14 +73,14 @@ impl Default for AgentConfig {
         Self {
             hidden: 128,
             replay_capacity: 50_000,
-            batch_size: 128,
-            discount: 0.97,
-            learning_rate: 3e-4,
+            batch_size: 256,
+            discount: 0.99,
+            learning_rate: 1e-3,
             epsilon_start: 1.0,
-            epsilon_end: 0.05,
-            epsilon_decay_secs: 45.0,
-            target_sync_interval: 1000,
-            warmup: 1024,
+            epsilon_end: 0.02,
+            epsilon_decay_steps: 20_000,
+            target_tau: 0.005,
+            warmup: 5_000,
         }
     }
 }
@@ -86,7 +96,7 @@ impl ParamShape {
     }
 }
 
-/// A DQN agent backed by two meganeura sessions.
+/// A Double-DQN agent backed by two meganeura sessions.
 pub struct Agent {
     cfg: AgentConfig,
     obs_dim: usize,
@@ -103,7 +113,7 @@ pub struct Agent {
     replay: VecDeque<Transition>,
     rng: rand::rngs::ThreadRng,
 
-    pub steps_since_target_sync: u32,
+    // (soft update replaces the hard-copy counter)
     pub gradient_steps: u64,
     pub inferences: u64,
     pub last_loss: f32,
@@ -120,10 +130,11 @@ impl Agent {
         assert!(num_envs >= 1, "num_envs must be ≥ 1");
 
         // Inference graph: obs[num_envs, obs_dim] -> q[num_envs, num_actions]
+        let na = num_actions as usize;
         let mut g_inf = Graph::new();
         let obs = g_inf.input("obs", &[num_envs, obs_dim]);
         let fc1 = nn::Linear::new(&mut g_inf, "fc1", obs_dim, cfg.hidden);
-        let fc2 = nn::Linear::new(&mut g_inf, "fc2", cfg.hidden, num_actions as usize);
+        let fc2 = nn::Linear::new(&mut g_inf, "fc2", cfg.hidden, na);
         let h = fc1.forward(&mut g_inf, obs);
         let h = g_inf.relu(h);
         let q = fc2.forward(&mut g_inf, h);
@@ -133,10 +144,10 @@ impl Agent {
         let mut g_train = Graph::new();
         let batch = cfg.batch_size;
         let obs_b = g_train.input("obs", &[batch, obs_dim]);
-        let act_mask = g_train.input("act_mask", &[batch, num_actions as usize]);
-        let target = g_train.input("target", &[batch, num_actions as usize]);
+        let act_mask = g_train.input("act_mask", &[batch, na]);
+        let target = g_train.input("target", &[batch, na]);
         let t_fc1 = nn::Linear::new(&mut g_train, "fc1", obs_dim, cfg.hidden);
-        let t_fc2 = nn::Linear::new(&mut g_train, "fc2", cfg.hidden, num_actions as usize);
+        let t_fc2 = nn::Linear::new(&mut g_train, "fc2", cfg.hidden, na);
         let th = t_fc1.forward(&mut g_train, obs_b);
         let th = g_train.relu(th);
         let q_all = t_fc2.forward(&mut g_train, th);
@@ -174,11 +185,11 @@ impl Agent {
             },
             ParamShape {
                 name: "fc2.weight".into(),
-                shape: vec![cfg.hidden, num_actions as usize],
+                shape: vec![cfg.hidden, na],
             },
             ParamShape {
                 name: "fc2.bias".into(),
-                shape: vec![num_actions as usize],
+                shape: vec![na],
             },
         ];
 
@@ -189,7 +200,6 @@ impl Agent {
             target_snapshot: Vec::new(),
             replay: VecDeque::with_capacity(cfg.replay_capacity),
             rng: rand::rng(),
-            steps_since_target_sync: 0,
             gradient_steps: 0,
             inferences: 0,
             last_loss: 0.0,
@@ -202,6 +212,14 @@ impl Agent {
         agent.init_parameters();
         agent.target_snapshot = agent.snapshot_training();
         agent
+    }
+
+    /// Wait for all in-flight GPU work on every session. Called
+    /// before the render resources are torn down so that the later
+    /// `Session::drop` pipeline cleanup doesn't race with the GPU.
+    pub fn destroy(&mut self) {
+        self.inference.wait();
+        self.training.wait();
     }
 
     pub fn num_envs(&self) -> usize {
@@ -239,25 +257,14 @@ impl Agent {
             .collect()
     }
 
-    fn sync_inference_from_training(&mut self) {
-        for p in &self.params {
-            let mut buf = vec![0.0_f32; p.len()];
-            self.training.read_param(&p.name, &mut buf);
-            self.inference.set_parameter(&p.name, &buf);
-        }
-    }
-
     /// Epsilon-greedy actions for a batch of `num_envs` observations.
     ///
     /// `obs_batch` is the flat row-major layout: `[env0.obs, env1.obs,
     /// ..., envN-1.obs]`, length `num_envs * obs_dim`.
-    pub fn select_actions(&mut self, obs_batch: &[f32], wall_secs: f32) -> Vec<Action> {
+    pub fn select_actions(&mut self, obs_batch: &[f32]) -> Vec<Action> {
         assert_eq!(obs_batch.len(), self.num_envs * self.obs_dim);
         self.inference.set_input("obs", obs_batch);
         self.inference.step();
-        // step() submits async; read_output maps CPU-side memory whose
-        // contents are undefined until the GPU has finished. Skipping
-        // wait() here silently returns stale data and breaks training.
         self.inference.wait();
         self.inferences += self.num_envs as u64;
 
@@ -265,7 +272,7 @@ impl Agent {
         let mut q = vec![0.0_f32; self.num_envs * na];
         self.inference.read_output_by_index(0, &mut q);
 
-        let eps = self.current_epsilon(wall_secs);
+        let eps = self.current_epsilon();
         let mut out = Vec::with_capacity(self.num_envs);
         for i in 0..self.num_envs {
             let a = if self.rng.random::<f32>() < eps {
@@ -278,14 +285,13 @@ impl Agent {
         out
     }
 
-    pub fn current_epsilon(&self, wall_secs: f32) -> f32 {
-        // Debug knob: pin epsilon to a fixed value for sanity checks.
+    pub fn current_epsilon(&self) -> f32 {
         if let Ok(v) = std::env::var("MEGAPLAYS_FORCE_EPSILON") {
             if let Ok(f) = v.parse::<f32>() {
                 return f.clamp(0.0, 1.0);
             }
         }
-        let t = (wall_secs / self.cfg.epsilon_decay_secs).clamp(0.0, 1.0);
+        let t = (self.gradient_steps as f32 / self.cfg.epsilon_decay_steps as f32).clamp(0.0, 1.0);
         self.cfg.epsilon_start + (self.cfg.epsilon_end - self.cfg.epsilon_start) * t
     }
 
@@ -321,9 +327,18 @@ impl Agent {
             let next_q_max = if t.done {
                 0.0
             } else {
-                self.target_forward_max(&t.next_obs)
+                let q = cpu_forward(
+                    &self.target_snapshot,
+                    &t.next_obs,
+                    self.obs_dim,
+                    self.cfg.hidden,
+                    na,
+                );
+                q.iter().copied().fold(f32::NEG_INFINITY, f32::max)
             };
-            target[i * na + t.action as usize] = t.reward + self.cfg.discount * next_q_max;
+            // Clamp the Bellman target to prevent Q-value divergence.
+            let td = (t.reward + self.cfg.discount * next_q_max).clamp(-5.0, 5.0);
+            target[i * na + t.action as usize] = td;
         }
 
         self.training.set_input("obs", &obs_flat);
@@ -339,55 +354,120 @@ impl Agent {
         let loss = self.training.read_output(1).first().copied().unwrap_or(0.0);
         self.last_loss = loss;
 
-        self.steps_since_target_sync += 1;
-        if self.steps_since_target_sync >= self.cfg.target_sync_interval {
-            self.target_snapshot = self.snapshot_training();
-            self.steps_since_target_sync = 0;
+        // Soft (Polyak) target update: target ← (1-τ)*target + τ*online.
+        let online = self.snapshot_training();
+        let tau = self.cfg.target_tau;
+        for (tgt, src) in self.target_snapshot.iter_mut().zip(online.iter()) {
+            for (t, &s) in tgt.iter_mut().zip(src.iter()) {
+                *t = *t * (1.0 - tau) + s * tau;
+            }
         }
 
-        self.sync_inference_from_training();
-
+        // Sync inference from the fresh online weights.
+        for (p, buf) in self.params.iter().zip(online.iter()) {
+            self.inference.set_parameter(&p.name, buf);
+        }
         Some(loss)
-    }
-
-    /// Forward pass through the target network on host (CPU). The MLP
-    /// is tiny, so this beats a third GPU session for target-Q
-    /// evaluation: no extra compile, no extra pipeline, no extra
-    /// parameter-upload traffic each target-sync interval.
-    fn target_forward_max(&self, obs: &[f32]) -> f32 {
-        let w1 = &self.target_snapshot[0];
-        let b1 = &self.target_snapshot[1];
-        let w2 = &self.target_snapshot[2];
-        let b2 = &self.target_snapshot[3];
-
-        let hidden = self.cfg.hidden;
-        let na = self.num_actions as usize;
-
-        let mut h = vec![0.0_f32; hidden];
-        for j in 0..hidden {
-            let mut acc = b1[j];
-            for i in 0..self.obs_dim {
-                acc += obs[i] * w1[i * hidden + j];
-            }
-            h[j] = acc.max(0.0);
-        }
-
-        let mut best = f32::NEG_INFINITY;
-        for a in 0..na {
-            let mut q = b2[a];
-            for j in 0..hidden {
-                q += h[j] * w2[j * na + a];
-            }
-            if q > best {
-                best = q;
-            }
-        }
-        best
     }
 
     pub fn replay_len(&self) -> usize {
         self.replay.len()
     }
+
+    /// Save current online weights and training state to a binary file.
+    ///
+    /// Format: `u64` gradient_steps, then for each parameter a `u32`
+    /// element count followed by that many little-endian `f32` values.
+    pub fn save_weights(&self, path: &std::path::Path) -> std::io::Result<()> {
+        use std::io::Write;
+        let snapshot = self.snapshot_training();
+        let mut f = std::fs::File::create(path)?;
+        f.write_all(&self.gradient_steps.to_le_bytes())?;
+        for buf in &snapshot {
+            let len = buf.len() as u32;
+            f.write_all(&len.to_le_bytes())?;
+            for &v in buf {
+                f.write_all(&v.to_le_bytes())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Load weights from a binary file produced by [`save_weights`].
+    /// Overwrites training, inference, target-network weights, and
+    /// restores gradient_steps (so epsilon resumes correctly).
+    pub fn load_weights(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+        use std::io::Read;
+        let mut f = std::fs::File::open(path)?;
+        let mut u64_buf = [0u8; 8];
+        f.read_exact(&mut u64_buf)?;
+        self.gradient_steps = u64::from_le_bytes(u64_buf);
+
+        let mut len_buf = [0u8; 4];
+        for p in &self.params {
+            f.read_exact(&mut len_buf)?;
+            let len = u32::from_le_bytes(len_buf) as usize;
+            if len != p.len() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "param {}: expected {} elements, file has {}",
+                        p.name,
+                        p.len(),
+                        len,
+                    ),
+                ));
+            }
+            let mut data = vec![0.0_f32; len];
+            let byte_slice =
+                unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, len * 4) };
+            f.read_exact(byte_slice)?;
+            self.training.set_parameter(&p.name, &data);
+            self.inference.set_parameter(&p.name, &data);
+        }
+        self.target_snapshot = self.snapshot_training();
+        log::info!(
+            "loaded weights from {} (grad_steps={}, eps={:.3})",
+            path.display(),
+            self.gradient_steps,
+            self.current_epsilon(),
+        );
+        Ok(())
+    }
+}
+
+/// CPU forward pass through a 2-layer MLP snapshot. Returns all
+/// Q-values for the given observation.
+fn cpu_forward(
+    weights: &[Vec<f32>],
+    obs: &[f32],
+    obs_dim: usize,
+    hidden: usize,
+    na: usize,
+) -> Vec<f32> {
+    let w1 = &weights[0];
+    let b1 = &weights[1];
+    let w2 = &weights[2];
+    let b2 = &weights[3];
+
+    let mut h = vec![0.0_f32; hidden];
+    for j in 0..hidden {
+        let mut acc = b1[j];
+        for i in 0..obs_dim {
+            acc += obs[i] * w1[i * hidden + j];
+        }
+        h[j] = acc.max(0.0); // ReLU
+    }
+
+    let mut q = vec![0.0_f32; na];
+    for a in 0..na {
+        let mut val = b2[a];
+        for j in 0..hidden {
+            val += h[j] * w2[j * na + a];
+        }
+        q[a] = val;
+    }
+    q
 }
 
 fn argmax(xs: &[f32]) -> usize {
