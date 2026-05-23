@@ -110,7 +110,7 @@ impl LanderGame {
     }
 
     fn spawn(&mut self) {
-        use rand::Rng;
+        use rand::RngExt;
         self.pos = Vec2::new(self.rng.random_range(-0.7..0.7), 0.85);
         self.vel = Vec2::new(self.rng.random_range(-0.2..0.2), 0.0);
         self.angle = self.rng.random_range(-0.2..0.2);

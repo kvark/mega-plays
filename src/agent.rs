@@ -27,7 +27,7 @@
 use std::{collections::VecDeque, sync::Arc};
 
 use meganeura::{Graph, Session, nn};
-use rand::{Rng, seq::IteratorRandom};
+use rand::{RngExt, seq::IteratorRandom};
 
 /// Observation vector. Flat f32s, caller-defined layout, normalised to
 /// roughly `[-1, 1]`.
@@ -317,7 +317,7 @@ impl Agent {
         let mut mask = vec![0.0_f32; batch * na];
         let mut target = vec![0.0_f32; batch * na];
 
-        let indices: Vec<usize> = (0..self.replay.len()).choose_multiple(&mut self.rng, batch);
+        let indices: Vec<usize> = (0..self.replay.len()).sample(&mut self.rng, batch);
 
         for (i, &ri) in indices.iter().enumerate() {
             let t = &self.replay[ri];

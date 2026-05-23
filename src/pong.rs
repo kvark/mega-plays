@@ -97,7 +97,7 @@ impl PongGame {
     }
 
     fn reset_ball(&mut self, toward_agent: bool) {
-        use rand::Rng;
+        use rand::RngExt;
         self.ball = Pos2::ZERO;
         let angle: f32 = self.rng.random_range(-0.3..0.3);
         let direction: f32 = if toward_agent { -1.0 } else { 1.0 };
@@ -116,7 +116,7 @@ impl PongGame {
     }
 
     fn update_opponent(&mut self, dt: f32) {
-        use rand::Rng;
+        use rand::RngExt;
         let noise = if self.opponent_noise > 0.0 {
             self.rng
                 .random_range(-self.opponent_noise..self.opponent_noise)

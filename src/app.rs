@@ -121,7 +121,9 @@ where
     .expect("init Blade context (headless)");
     let gpu = Arc::new(gpu);
 
-    let mut games: Vec<G> = (0..config.num_envs).map(|_| build_game(gpu.clone())).collect();
+    let mut games: Vec<G> = (0..config.num_envs)
+        .map(|_| build_game(gpu.clone()))
+        .collect();
     let spec = games[0].spec();
 
     let mut agent = Agent::new(

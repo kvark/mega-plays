@@ -28,8 +28,7 @@ winit = "0.30"
 bytemuck = { version = "1", features = ["derive"] }
 log = "0.4"
 env_logger = "0.11"
-glam = "0.30"
-rand = "0.9"
+rand = "0.10"
 # Shared with meganeura (already a transitive dep); used to emit CPU
 # spans that meganeura's profiler captures onto the Perfetto track.
 tracing = { version = "0.1", default-features = false, features = ["std"] }
