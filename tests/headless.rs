@@ -169,10 +169,13 @@ fn pong_learns_to_beat_slow_opponent() {
     // Warm up: fill the replay buffer (1000 frames × 4 substeps).
     train_headless(&mut games, &mut agent, 1000, 4, 0);
 
-    // Train: ~480 simulated seconds at 60fps, 4 substeps + 8 grad
-    // steps per frame — long enough for epsilon to decay and the
-    // agent to learn ball tracking + scoring.
-    let (mean_return, win_rate, grad_steps) = train_headless(&mut games, &mut agent, 28800, 4, 8);
+    // Train: long enough for epsilon to fully decay (20 k grad steps at
+    // 8 grad/frame = 2500 frames) plus a few thousand more to learn the
+    // ball-tracking policy. The earlier 28 800 frames pre-dated the
+    // stale-action fix; with corrected transition recording + Double-DQN
+    // + action repeat, pong reaches the 40 % win-rate gate in well
+    // under 6 000 frames.
+    let (mean_return, win_rate, grad_steps) = train_headless(&mut games, &mut agent, 6000, 4, 8);
 
     eprintln!(
         "pong headless: mean_return={mean_return:.2} win_rate={:.1}% \
