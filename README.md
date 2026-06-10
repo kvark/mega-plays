@@ -1,57 +1,54 @@
 # mega-plays
 
-Games where the opponents learn in real time, on your laptop's GPU, in Rust — no CUDA, no Python.
+Games where the opponents learn in real time, on your laptop's GPU, in Rust —
+no CUDA, no Python.
 
 Showcase for [meganeura](https://github.com/kvark/meganeura) (GPU neural
 network inference and training) and [blade-graphics](https://github.com/kvark/blade).
 Every agent you see playing is training live: fresh-start on launch,
-visibly improving within a minute, converged within a few.
+visibly improving inside a minute, converged in two.
 
 ## Status
 
-Alive, noisily learning. Two games so far:
+Two games shipping; both learn live and visibly on a CPU-Vulkan stress
+floor (Xvfb + lavapipe):
 
-- **pong** — 4×4 grid of parallel games against a scripted tracker.
-  Win rate climbs from random (~11 %) toward 20 %+ within the first
-  minute before epsilon decays.
-- **lander** — 16 parallel lunar-lander instances with one rigid body
-  in constant-gravity, 3 discrete thrusters, and a small pad to hit
-  softly. Physics and rendering are solid; the DQN does not yet
-  reliably land on the pad in CPU-Vulkan smoke tests. Sparse ±10
-  reward plus a 4-action space needs more samples — or a better
-  algorithm — than a 2-minute xvfb run produces.
+- **pong** — 3×3 grid of parallel games against a scripted tracker.
+  Reaches ~50 % win-rate at the default difficulty in ~60 s of training;
+  the auto-curriculum then ratchets the opponent's tracking speed up
+  toward the target W/L of 1.5 (so the headline win-rate stays near 60 %
+  by design — watch the **difficulty plot** for the real progress curve).
+- **lander** — parallel lunar landers in constant gravity, three discrete
+  thrusters plus idle, a small landing pad at the centre of the ground.
+  After the truncation / ceiling / clamp fixes the agent now reliably
+  *touches* the ground softly within a few minutes; pad accuracy keeps
+  climbing past that.
 
 Both run as separate binaries (`cargo run --release --bin pong` /
-`--bin lander`). They share the `mega-plays` library: same driver,
-same DQN agent, same overlay — only the `Game` impl differs.
+`--bin lander`). They share the `mega-plays` library: same driver, same
+DQN agent, same overlay — only the `Game` impl differs.
 
-Each physics substep does one batched inference pass on the shared
-policy to produce N actions in parallel.
-
-Measured on Xvfb + lavapipe (CPU Vulkan, the worst-case target):
-~25 fps rendering, ~50 gradient steps / sec, warmup fills the 50 k
-replay buffer in ~5 seconds, win rate climbs from random (~11 %)
-toward 20 %+ within the first minute before epsilon decays. DQN
-stability is still rough — win rate sometimes regresses under
-sustained training and wants prioritised replay or Double-DQN to
-hold. Those are the obvious next steps.
-
-A real discrete GPU will be dramatically faster — the CPU Vulkan
-numbers are a stress floor, not a target.
+Each "decision" the agent makes is held for `action_repeat` physics
+substeps (default 4) — DQN's standard frame-skip trick. Cuts inference
+round-trip count 4× and turns ε-greedy into a real exploration signal
+(120 Hz sub-perception dithering averages to zero net torque).
 
 ## Layout
 
 ```
 mega-plays/
 ├── Cargo.toml
+├── AUDIT_PLAN.md           # what's intentionally still rough, and why
 ├── src/
-│   ├── lib.rs                # re-exports
-│   ├── agent.rs              # DQN agent: replay buffer, target net, meganeura wiring
-│   ├── app.rs                # winit driver, Blade context, egui overlay, main loop
-│   ├── game.rs               # Game trait
-│   ├── stats.rs              # rolling stats, sparkline
-│   ├── pong.rs               # Pong physics + rendering
-│   ├── lander.rs             # Lunar lander physics + rendering
+│   ├── lib.rs              # re-exports
+│   ├── agent.rs            # Double-DQN: replay buffer, target net, meganeura
+│   ├── app.rs              # winit driver, Blade context, egui overlay, main loop
+│   ├── env_loop.rs         # one decision burst across N parallel envs
+│   ├── game.rs             # Game trait, StepOutcome { done | truncated }
+│   ├── stats.rs            # rolling stats, sparkline
+│   ├── pong.rs             # Pong physics + rendering
+│   ├── lander.rs           # Lunar lander physics + rendering
+│   ├── profiling.rs        # Perfetto trace glue (off by default)
 │   └── bin/
 │       ├── pong.rs
 │       └── lander.rs
@@ -68,9 +65,10 @@ cargo run --release --bin pong
 ```
 
 Meganeura is pulled in as a normal git dependency pinned by SHA in
-`Cargo.toml`. Bump that SHA and the `blade-graphics = "=0.8.2"` pin
-in lockstep if a new meganeura revision changes its blade version —
-see the lockstep-versioning note further down.
+`Cargo.toml`. Blade is pinned by SHA the same way. Bump both in lockstep
+— two crate versions of the same FFI type are two different Rust types,
+so a mismatched blade rev between mega-plays and meganeura simply
+doesn't link.
 
 Release mode is strongly preferred — debug throughput on the training
 loop is not representative and the overlay stats will misread.
@@ -85,16 +83,16 @@ MEGAPLAYS_EXIT_AFTER_SECS=60 \
 xvfb-run -s "-screen 0 1280x800x24" cargo run --release --bin pong
 ```
 
-`MEGAPLAYS_EXIT_AFTER_SECS` self-exits after the given wall time; the
-app prints a per-2-second stats heartbeat so you can watch the win
-rate move without a display.
+`MEGAPLAYS_EXIT_AFTER_SECS` self-exits after the given wall time. The
+windowed app prints a per-2-second heartbeat so you can watch the win
+rate move without a display. There's also `MEGA_HEADLESS=<frames>` for
+a no-window, no-render path (useful for traces on hosts that can't
+acquire a display surface — the heartbeat now prints rolling win-rate
+and loss-EMA there too).
 
 ## Design choices and departures from the original sketch
 
-The `README` version that seeded this project served as a design brief;
-the following notes explain where the implementation diverged and why.
-
-### Rendering goes through egui — no `cosmic-text`, no custom pipeline
+### Rendering goes through egui — no cosmic-text, no custom pipeline
 
 Every on-screen element — paddles, ball, scores, stats, sparklines — is
 an egui primitive. We do not compile our own WGSL shaders, do not run an
@@ -110,65 +108,62 @@ crate with a direct Blade pipeline; the driver already owns the
 
 ### One Blade context, shared between renderer and meganeura
 
-`meganeura::Session::with_context(plan, Arc<Context>)` — added as part
-of this project on the companion meganeura branch — lets the driver
+`meganeura::Session::with_context(plan, Arc<Context>)` lets the driver
 create the Blade context once and hand a clone to both the renderer's
 egui painter and the training / inference sessions. Same device, same
 queue, same memory allocator, no device-enumeration surprises.
 
-Context sharing goes through the unified `meganeura::build(graph,
-SessionConfig { gpu: Some(ctx), .. })` entry point, which replaced the
-`build_session` / `build_session_with` / `build_session_with_report` /
-`build_session_cached` / `build_inference_session_with` family on the
-companion branch.
-
-### Lockstep blade-graphics versioning
-
-Because two crate versions of the same FFI type are two different
-types at the Rust level, meganeura and mega-plays have to agree on
-*exact* `blade-graphics` version. The workspace pins
-`blade-graphics = "=0.8.2"` — the same version meganeura 0.2 depends
-on. Bumping either side requires bumping both.
-
 ### Vectorised environments, shared policy
 
-The driver runs `num_envs` (default 16) parallel pong games against a
-single DQN. Every physics substep gathers observations from all
-environments, does **one** batched forward pass through the inference
-session, and picks 16 actions at once. The replay buffer collects
-transitions from all environments indiscriminately. This keeps GPU
-utilisation reasonable on a modest network and means warmup fills in
-seconds rather than minutes.
+The driver runs `num_envs` (default 9) parallel games against a single
+DQN. Every burst gathers observations from all environments, does **one**
+batched forward pass through the inference session, and picks 9 actions
+at once. The replay buffer collects transitions from all environments
+indiscriminately. Warmup fills in seconds rather than minutes.
 
-### No cross-thread training, yet
+### Single-threaded driver (for now)
 
-The driver is single-threaded: each frame advances physics N times,
-runs one batched inference per substep, and runs a few minibatch
-gradient steps. No lock-free MPSC queue, no double-buffered weight
-handoff. The hooks exist — see `Agent::train_step` and
-`Running::tick` — but shipping that concurrency before any real
-numbers are measured would be optimising the imagined profile.
+Each frame advances physics N times (in bursts of `action_repeat`
+substeps per inference), runs minibatch gradient steps, then renders.
+The per-frame physics+training loop is capped at `frame_budget_ms`
+(default 12 ms) so the speed slider can ask for more than the machine
+can deliver without freezing the UI; the overlay surfaces the achieved
+sim multiplier so the user can tell "slider is in the way" from "machine
+is in the way." A worker-thread split — moving the training session
+off the event loop so render fps is independent of grad-step throughput
+— is sketched in `AUDIT_PLAN.md`. Blade's Vulkan `Context` already
+guards its queue with a `Mutex`, so the structural change is supported.
 
 ### `step()` is async; `wait()` before reading
 
 Meganeura's `Session::step` submits GPU work but doesn't block. Reading
-any buffer afterwards (inference outputs, training loss, parameters
-to copy into a target snapshot) without an intervening `wait()` returns
-whatever was in the host-visible memory *before* the submission
-landed. During bring-up this produced a policy that learned a stable
-bad strategy — loss dropped cleanly, but the action choices were
-driven by stale uninitialised Q values. The fix is mundane: `step();
-wait(); read_*(...);` everywhere meganeura's buffers are consumed on
-the host. See `select_actions` and `train_step` in `src/agent.rs`.
+any buffer afterwards (inference outputs, training loss, parameters to
+copy into a target snapshot) without an intervening `wait()` returns
+whatever was in the host-visible memory *before* the submission landed.
+During bring-up this produced a policy that learned a stable bad
+strategy — loss dropped cleanly, but the action choices were driven by
+stale uninitialised Q values. The fix is mundane: `step(); wait();
+read_*(...);` everywhere meganeura's buffers are consumed on the host.
 
-### DQN variant: mask-based target fitting
+### Real Double-DQN
+
+The online network picks the action at the next state, the target
+network evaluates its Q-value. Decoupling action selection from value
+estimation kills the systematic positive bias of vanilla DQN
+(`max_a Q'(s', a)` over a noisy Q' is biased above the true max); in
+practice that's the difference between a run that holds its gains and
+one that regresses late in training. Both networks live as CPU-side
+weight snapshots (the network is ~4 k parameters, host-side forward is
+sub-microsecond).
+
+### DQN training: mask-based target fitting
 
 The training graph feeds a one-hot action mask and a target Q value
 scattered into the same action slot. The loss is plain MSE:
 
 ```
 masked_q = q_all * action_mask
-masked_t = target * action_mask
+masked_t = target   * action_mask
 loss     = mean((masked_q - masked_t)^2)
 ```
 
@@ -177,62 +172,98 @@ gradient. This avoids needing a gather op, which meganeura does not
 currently expose. If / when gather lands we can switch to the more
 standard Huber loss over a single Q-value.
 
-### Target network: host-side forward pass, for now
+### `done` vs `truncated` — episode boundaries that don't lie to bootstrap
 
-The target network is a parameter snapshot refreshed every N gradient
-steps. Bootstrap targets are computed on host with a straightforward
-MLP evaluation (two matrix multiplies, ReLU) — the MLP is ~4k weights,
-a rounding error next to the GPU training minibatch. When the network
-grows, a dedicated GPU inference session with target parameters is the
-right next step; swapping parameters into the live inference session
-every step would conflict with action selection on the main loop.
+`StepOutcome` carries both: `done` means the world reached an absorbing
+state (Bellman target is cut, no bootstrap past it), `truncated` means
+the env reset for management reasons (time limit, escape boundary —
+bootstrap target *survives*, the recorded transition's `done` flag
+stays false). Lander uses `truncated` for both its 15 s episode
+time-limit and its world ceiling. Without that the hover-forever
+policy was a stable local optimum.
 
 ## Pong specifics
 
-- 6-float observation: own paddle y, opponent paddle y, ball (x, y), ball (vx, vy).
-- 3 discrete actions: stay, up, down.
-- Reward: +1 on scoring, -1 on being scored on, 0 otherwise.
-- Opponent: scripted tracker with adjustable y-noise (tune from the overlay).
+- 6-float observation: own paddle y, opponent paddle y, ball (x, y),
+  ball (vx, vy).
+- 3 discrete actions: stay, up, down. Held for 4 substeps each.
+- Reward: ±1 on scoring, 0 otherwise (plus a tiny potential-based
+  shaping for paddle-ball alignment, off by default).
+- Opponent: scripted tracker with adjustable y-noise and speed-fraction
+  sliders. Auto-curriculum nudges its tracking speed to maintain the
+  target win/loss ratio (default 1.5 ≈ 60 % wins).
 - Fixed-step physics at 120 Hz; render at whatever the window reports.
-
-Self-play, league sampling, scripted-bootstrap mixing, human control and
-recording are all on the roadmap but intentionally not shipped in v0 —
-we want empirical evidence that the learning loop works against a
-stationary opponent first.
-
-## Controls
-
-- `Space` — pause / resume physics (training continues).
-- `G` — toggle the stats panel.
-- `V` — switch between **grid** (one tile per env) and **overlay**
-  (all envs painted into the same rect with alpha blending, the
-  current best rollout — longest live episode — on top at full
-  opacity). Super Meat Boy's "replay" screen is the visual
-  reference. Can also be set initially with the env variable
-  `MEGAPLAYS_VIEW=overlay`.
-- `R` — reset agent weights and replay buffer.
-- `Esc` — quit.
 
 ## Lander specifics
 
-- 7-float observation: position (x, y), velocity (vx, vy),
-  `sin/cos` of the lander's angle, angular velocity / 2.
+- 7-float observation: position (x, y), velocity (vx, vy), `sin/cos`
+  of the lander's angle, angular velocity scaled to roughly [-1, 1].
 - 4 discrete actions: idle, main engine, left RCS, right RCS.
-- Physics: pure semi-implicit Euler, constant gravity (`g = 0.8`),
-  main thrust `1.6` along the craft's "up" axis, RCS torque
-  `4 rad/s²`. No physics library — the craft is one rigid body in
-  a horizontal-ground world, which doesn't need one.
-- Terminal reward: `+10` for a soft landing on the pad (upright,
-  slow, inside ±0.15 of centre), `+2` for a soft landing off-pad,
-  `-10` for a crash or going out of the horizontal bounds.
-- Shaping: small per-step penalties for distance to the pad, tilt,
-  and thrust usage — same idea as pong's tracking shaping, kept
-  small relative to the sparse ±10 terminal.
+- Physics: pure semi-implicit Euler, constant gravity, main thrust
+  along the craft's "up" axis, RCS torque. No physics library — the
+  craft is one rigid body in a horizontal-ground world, which doesn't
+  need one.
+- Terminal reward: `+TERMINAL_REWARD` for a soft landing on the pad
+  (upright, slow, inside ±0.15 of centre), 0 for a soft landing off
+  pad (episode still ends but it's not a "win"), `-TERMINAL_REWARD`
+  for a crash or going out of the horizontal/vertical bounds.
+- Truncation: 15 s of physics with no terminal → reset, bootstrap
+  survives. The hoverer is no longer a stable local optimum, and
+  the overlay's "hero env" doesn't celebrate it either.
+- The lander binary sets `td_target_clamp = TERMINAL_REWARD * 1.05`
+  so the ±10 sparse signal isn't compressed by the agent's default
+  ±5 clamp.
 
-Both rendering and physics are dependency-free beyond the `glam`
-we already use. The lander is drawn as a triangle body plus landing
-legs; the main engine plume shows as an orange triangle under the
-craft while firing.
+Both rendering and physics are dependency-free beyond `glam`. The
+lander is drawn as a triangle body plus landing legs; the main engine
+plume shows as an orange triangle under the craft while firing.
+
+## Controls
+
+- `Space` — pause physics. **Training continues** so the network keeps
+  chewing on what's already in replay.
+- `G` — toggle the stats panel.
+- `V` — switch between **grid** (one tile per env) and **overlay** (all
+  envs painted into the same rect with alpha blending, the current
+  best-performing env — highest most-recent return — on top at full
+  opacity). Super Meat Boy's replay screen is the visual reference.
+  Initial mode also settable via `MEGAPLAYS_VIEW=overlay`.
+- `R` — reset agent weights and replay buffer.
+- `T` — run a 10 000-frame headless training epoch in chunks (progress bar).
+- `S` — save current weights to `<game-title>.weights`.
+- `L` — load weights from `<game-title>.weights`.
+- `Esc` — quit.
+
+The training panel exposes:
+
+- Number of parallel envs (applied on next reset).
+- Speed multiplier slider (1×–32×). Pinned by the per-frame compute
+  budget shows in amber; "effective N×" tells you the achieved rate.
+- View toggle (grid / overlay).
+- Pause / resume.
+- Save / load weights.
+- Training loss curve (log-y), episode return curve, instantaneous
+  reward sparkline.
+- Game-specific sliders (pong opponent speed / noise / shaping).
+- Auto-curriculum toggle + target W/L drag-value.
+- **Win-rate EMA plot with the target as a dashed reference line** —
+  the controlled variable when curriculum is on.
+- **Difficulty over wall time** — the controlling variable, where to
+  look for "we're learning" when win-rate is pinned to target.
+
+## Environment variables
+
+- `MEGAPLAYS_NUM_ENVS=<n>` — override the default `num_envs` at launch
+  (windowed and headless).
+- `MEGAPLAYS_VIEW=overlay` — start in overlay view.
+- `MEGAPLAYS_EXIT_AFTER_SECS=<n>` — self-exit after this wall time.
+- `MEGAPLAYS_FORCE_EPSILON=<f>` — pin ε to this value (for tests).
+- `MEGA_HEADLESS=<frames>` — skip window/surface/render entirely, run
+  `frames` ticks of the physics+training loop, exit. Logs rolling
+  win-rate and loss EMA every 500 frames.
+- `MEGA_TRACE=<path|off>` — Perfetto trace destination. Off by default
+  for normal runs; set to a path to capture CPU spans + GPU pass
+  timings into a single `.pftrace`.
 
 ## Candidates for the next game
 
@@ -243,19 +274,15 @@ something that converges in well under a minute on a modest laptop
 GPU, keeps the observation space flat and ≤ ~16 floats, and produces
 an on-screen policy the viewer can *see* getting better.
 
-With pong and lander shipped, the remaining candidates, ranked by
-how well they fit the "visibly learning within 30 s" brief:
-
 1. **Catch / paddle-under-faller.** One paddle along the bottom, one
-   ball dropping from a random x with a sideways velocity. Reward
-   +1 on catch, -1 on miss, episodes ~1 s. Easier than pong —
-   tracking without an adversary — so even a poorly-tuned network
-   converges in ~15 s and makes the harness's own behaviour easy to
-   isolate from DQN difficulty.
+   ball dropping from a random x with a sideways velocity. Reward +1
+   on catch, -1 on miss, episodes ~1 s. Easier than pong — tracking
+   without an adversary — so even a poorly-tuned network converges in
+   ~15 s and makes the harness's own behaviour easy to isolate from
+   DQN difficulty.
 2. **Grid-based find-the-food.** 8×8 grid, agent + food glyph, 4
    directional actions. Trivial physics, classic RL benchmark,
-   benefits directly from the vectorised-env pipeline we already
-   have (16 grids train much faster than one).
+   benefits directly from the vectorised-env pipeline.
 3. **Flappy-pipe.** Agent with gravity + one "flap" action, pipes
    scroll in. Episodes end on hit. Famous for being almost trivial
    with the right reward shaping and catastrophic without it — a
@@ -263,12 +290,12 @@ how well they fit the "visibly learning within 30 s" brief:
 4. **Simple arena-dodger.** Agent dodges projectiles in an arena;
    reward is time alive. Related in shape to pong but single-agent,
    no opponent model needed. A reasonable step toward the multi-
-   agent / league-sampling variants sketched above.
+   agent / league-sampling variants sketched in `AUDIT_PLAN.md`.
 
 **Non-candidates for now** — Breakout (physics is only superficially
-simple; tile state blows observation size), Atari-pixel games
-(CNN-on-pixels is an explicit v0.4 goal, not v0.2), anything
-multi-agent (needs the self-play machinery we haven't built yet).
+simple; tile state blows observation size), Atari-pixel games (CNN-on-
+pixels is an explicit v0.4 goal, not v0.2), anything multi-agent (needs
+the self-play machinery we haven't built yet).
 
 ## Platform support
 

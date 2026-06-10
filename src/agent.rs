@@ -442,9 +442,7 @@ impl Agent {
         for buf in &snapshot {
             let len = buf.len() as u32;
             f.write_all(&len.to_le_bytes())?;
-            for &v in buf {
-                f.write_all(&v.to_le_bytes())?;
-            }
+            f.write_all(bytemuck::cast_slice(&buf[..]))?;
         }
         Ok(())
     }
@@ -475,9 +473,7 @@ impl Agent {
                 ));
             }
             let mut data = vec![0.0_f32; len];
-            let byte_slice =
-                unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, len * 4) };
-            f.read_exact(byte_slice)?;
+            f.read_exact(bytemuck::cast_slice_mut(&mut data[..]))?;
             self.training.set_parameter(&p.name, &data);
             self.inference.set_parameter(&p.name, &data);
         }
