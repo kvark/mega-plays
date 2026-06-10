@@ -67,6 +67,15 @@ where
     G: Game + 'static,
     F: FnMut(Arc<gpu::Context>) -> G + 'static,
 {
+    // egglog emits one "Global `n0` should start with `$`" warning per
+    // session build, which is harmless graph-naming noise from
+    // meganeura. Silence egglog at WARN-and-below by default; user
+    // RUST_LOG still overrides. (Order matters — we set the var before
+    // env_logger reads it.)
+    if std::env::var_os("RUST_LOG").is_none() {
+        // Default: info for the rest, error for egglog.
+        unsafe { std::env::set_var("RUST_LOG", "info,egglog=error") };
+    }
     env_logger::init();
     // Drop-guard that saves a Perfetto-compatible `.pftrace` on exit
     // (path controlled by MEGA_TRACE, default `./mega-plays.pftrace`).

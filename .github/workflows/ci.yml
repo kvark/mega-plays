@@ -42,7 +42,7 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
 
       - name: Build
-        run: cargo build --release --bin pong
+        run: cargo build --release --bin pong --bin lander
 
       - name: Unit tests
         run: cargo test --workspace --lib
