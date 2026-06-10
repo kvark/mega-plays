@@ -42,15 +42,33 @@ pub struct GameSpec {
 }
 
 /// A reward and episode-boundary signal.
+///
+/// `done` and `truncated` are distinct in the Sutton-and-Barto / Gymnasium
+/// sense: `done` is a true terminal — the episode ended because the world
+/// reached an absorbing state, and the Bellman target should *not* bootstrap
+/// past it. `truncated` means the episode ended for env-management reasons
+/// (a time limit, an out-of-bounds we treat as "give up", training
+/// scheduling) and the bootstrap target should *still* use the next state's
+/// Q-value. In both cases the harness calls `Game::reset`. Both being true
+/// at the same time means "true terminal happened on the last allowed
+/// substep" — `done` wins.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StepOutcome {
     /// Total reward this step — terminal + any dense shaping.
     pub reward: f32,
-    /// True when the episode ends on this step.
+    /// True when the episode ends because the world reached an absorbing
+    /// state. The recorded transition's `done` flag is this, so the
+    /// Bellman target is cut.
     pub done: bool,
-    /// The sparse terminal-reward component (±1 for win/loss, 0 while
-    /// in play). The harness uses this — not `reward` — to count wins
-    /// so that shaping can't skew the scoreboard.
+    /// True when the episode ends for env-management reasons (time
+    /// limit, escape boundary). The harness still resets the game, but
+    /// the recorded transition's `done` flag stays `false` so the
+    /// bootstrap target survives.
+    pub truncated: bool,
+    /// The sparse terminal-reward component (e.g. `±TERMINAL_REWARD`
+    /// for a true terminal, 0 while in play, 0 on truncation). The
+    /// harness uses this — not `reward` — to count wins so that shaping
+    /// can't skew the scoreboard.
     pub terminal_reward: f32,
 }
 

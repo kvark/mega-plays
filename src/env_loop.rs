@@ -68,12 +68,16 @@ pub fn run_burst<G, F>(
     };
 
     let mut burst_reward = vec![0.0_f32; games.len()];
-    let mut env_done = vec![false; games.len()];
+    // `terminated` cuts the Bellman bootstrap; `should_reset` covers both
+    // termination and truncation (env stops stepping for the rest of the
+    // burst, and we reset at the end).
+    let mut terminated = vec![false; games.len()];
+    let mut should_reset = vec![false; games.len()];
 
     let _physics = tracing::info_span!("physics").entered();
     for _ in 0..repeat {
         for (i, g) in games.iter_mut().enumerate() {
-            if env_done[i] {
+            if should_reset[i] {
                 continue;
             }
             let action = actions[i];
@@ -81,7 +85,10 @@ pub fn run_burst<G, F>(
             burst_reward[i] += outcome.reward;
             on_step(i, action, outcome);
             if outcome.done {
-                env_done[i] = true;
+                terminated[i] = true;
+                should_reset[i] = true;
+            } else if outcome.truncated {
+                should_reset[i] = true;
             }
         }
     }
@@ -93,9 +100,9 @@ pub fn run_burst<G, F>(
             action: actions[i],
             reward: burst_reward[i],
             next_obs,
-            done: env_done[i],
+            done: terminated[i],
         });
-        if env_done[i] {
+        if should_reset[i] {
             g.reset();
         }
     }

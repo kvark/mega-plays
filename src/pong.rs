@@ -205,6 +205,10 @@ impl Game for PongGame {
         self.agent_y = 0.0;
         self.opponent_y = 0.0;
         self.reset_ball(true);
+        // Without this, the first substep of every episode delivers a
+        // spurious shaping reward proportional to the *previous*
+        // episode's final paddle-ball distance.
+        self.prev_dist = 0.0;
     }
 
     fn step(&mut self, action: Action) -> StepOutcome {
@@ -222,6 +226,7 @@ impl Game for PongGame {
         StepOutcome {
             reward: terminal_r + shaping,
             done,
+            truncated: false,
             terminal_reward: terminal_r,
         }
     }
