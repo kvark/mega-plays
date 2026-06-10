@@ -13,10 +13,13 @@
 //!   the ~few-thousand-parameter MLPs used here; when networks grow,
 //!   a GPU-side weight copy becomes worth the effort.
 //!
-//! - The target network is a CPU-side snapshot of the training
-//!   weights. Double DQN: the online network selects the best action,
-//!   the target network evaluates it. This eliminates the
-//!   overestimation bias of standard DQN.
+//! - The target network is a Polyak-averaged CPU-side snapshot of the
+//!   training weights. *Double*-DQN: the online network picks the
+//!   action at the next state, the target network evaluates its
+//!   Q-value. The decoupling kills the positive bias of vanilla DQN —
+//!   `max_a Q'(s', a)` over a noisy Q' systematically overestimates
+//!   the true max — and is the difference between a run that holds
+//!   its gains and one that regresses late in training.
 //!
 //! - Epsilon decays by gradient steps, not wall clock, so training
 //!   progress is deterministic regardless of frame rate.
@@ -334,10 +337,24 @@ impl Agent {
 
     /// Run one minibatch gradient step if enough transitions have been
     /// collected. Returns the loss, or `None` when skipped.
+    ///
+    /// Implements *Double-DQN* (van Hasselt et al., 2015): the online
+    /// network picks the action at the next state, the target network
+    /// evaluates its Q-value. This decouples action selection from
+    /// value estimation, killing the positive bias of vanilla DQN
+    /// (`max_a Q'(s', a)` over a noisy Q' systematically overestimates
+    /// the true max), which in practice is the difference between a
+    /// run that holds its gains and one that regresses late in training.
     pub fn train_step(&mut self) -> Option<f32> {
         if self.replay.len() < self.cfg.warmup.max(self.cfg.batch_size) {
             return None;
         }
+
+        // Pre-step online snapshot — used for the Double-DQN argmax
+        // *and* as the source for the post-step Polyak target update.
+        // The Polyak τ is so small (default 0.005) that a one-step lag
+        // between pre and post in the target update is negligible.
+        let online = self.snapshot_training();
 
         let batch = self.cfg.batch_size;
         let obs_dim = self.obs_dim;
@@ -357,14 +374,17 @@ impl Agent {
             let next_q_max = if t.done {
                 0.0
             } else {
-                let q = cpu_forward(
+                let online_q =
+                    cpu_forward(&online, &t.next_obs, self.obs_dim, self.cfg.hidden, na);
+                let best_a = argmax(&online_q);
+                let target_q = cpu_forward(
                     &self.target_snapshot,
                     &t.next_obs,
                     self.obs_dim,
                     self.cfg.hidden,
                     na,
                 );
-                q.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+                target_q[best_a]
             };
             // Clamp the Bellman target to prevent Q-value divergence.
             // The clamp must be ≥ the largest |terminal reward| or the
@@ -389,7 +409,6 @@ impl Agent {
         self.last_loss = loss;
 
         // Soft (Polyak) target update: target ← (1-τ)*target + τ*online.
-        let online = self.snapshot_training();
         let tau = self.cfg.target_tau;
         for (tgt, src) in self.target_snapshot.iter_mut().zip(online.iter()) {
             for (t, &s) in tgt.iter_mut().zip(src.iter()) {
@@ -397,8 +416,12 @@ impl Agent {
             }
         }
 
-        // Sync inference from the fresh online weights.
-        for (p, buf) in self.params.iter().zip(online.iter()) {
+        // Sync inference from the post-step weights — re-snapshot so
+        // inference sees the most recent gradient update (online[] is
+        // pre-step). One extra read_param + wait per train_step; for a
+        // ~4k-param MLP this is microseconds.
+        let online_post = self.snapshot_training();
+        for (p, buf) in self.params.iter().zip(online_post.iter()) {
             self.inference.set_parameter(&p.name, buf);
         }
         Some(loss)
