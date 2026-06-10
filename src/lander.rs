@@ -25,14 +25,19 @@
 //! - 2 — left RCS   (torque CCW: rotates the lander counter-clockwise)
 //! - 3 — right RCS  (torque CW)
 //!
-//! Terminal reward:
+//! Rewards split into a *sparse* component that goes into the agent's
+//! reward stream and a *terminal sentinel* that the harness counts for
+//! the scoreboard:
 //!
-//! - `+TERMINAL_REWARD` for a soft landing on the pad (upright,
-//!   velocity within thresholds, horizontal position inside the pad);
-//! - `+PARTIAL_LANDING_REWARD` for a soft landing anywhere else on
-//!   the ground;
-//! - `-TERMINAL_REWARD` for a crash (touching ground with too much
-//!   velocity or tilt) or going out of the horizontal bounds.
+//! - On-pad soft landing:  reward `+TERMINAL_REWARD`,   sentinel `+TERMINAL_REWARD`  → win.
+//! - Off-pad soft landing: reward `+PARTIAL_LANDING_REWARD`, sentinel `0`        → not a win.
+//! - Crash / out-of-bounds: reward `-TERMINAL_REWARD`,  sentinel `-TERMINAL_REWARD`  → loss.
+//!
+//! The off-pad soft landing case is the intermediate skill —
+//! "touch down softly *anywhere*" — between "don't crash" and "hit the
+//! ±0.15 pad". We pay the agent for it so the policy has a stepping
+//! stone, but pad-rate (the headline metric) only counts the on-pad
+//! case.
 //!
 //! Plus dense shaping per step: penalise distance to the pad, tilt,
 //! and fuel usage. The shaping is kept small so the sparse ±10 signal
@@ -221,28 +226,31 @@ impl Game for LanderGame {
         self.step_count += 1;
 
         let landing = self.classify_state();
-        let (terminal_r, done) = match landing {
+        // Returns (sparse_reward, terminal_sentinel, done). `sparse_reward`
+        // folds into the learning signal; `terminal_sentinel` is what the
+        // harness counts as a win/loss for the scoreboard. They differ for
+        // partial landings: a soft touchdown off-pad is the natural
+        // stepping-stone skill between "don't crash" and "hit the ±0.15
+        // pad", so we still pay the agent for it — but it's not a "win"
+        // for pad-rate accounting.
+        let (sparse_reward, terminal_r, done) = match landing {
             Landing::SoftOnPad => {
                 self.landings += 1;
-                (TERMINAL_REWARD, true)
+                (TERMINAL_REWARD, TERMINAL_REWARD, true)
             }
             Landing::SoftElsewhere => {
                 self.partials += 1;
-                // Partial landings are *not* counted as wins by the
-                // harness (terminal_reward = 0). Pad-rate is the honest
-                // metric. The episode still ends — there's no recovery
-                // from sitting upright on the wrong patch of ground.
-                (0.0, true)
+                (PARTIAL_LANDING_REWARD, 0.0, true)
             }
             Landing::Crash => {
                 self.crashes += 1;
-                (-TERMINAL_REWARD, true)
+                (-TERMINAL_REWARD, -TERMINAL_REWARD, true)
             }
             Landing::OutOfBounds => {
                 self.crashes += 1;
-                (-TERMINAL_REWARD, true)
+                (-TERMINAL_REWARD, -TERMINAL_REWARD, true)
             }
-            Landing::None => (0.0, false),
+            Landing::None => (0.0, 0.0, false),
         };
 
         // Truncation: hard time limit forces a reset so a hovering
@@ -266,7 +274,7 @@ impl Game for LanderGame {
         // here, which made the post-step `observation()` already point
         // at the freshly-spawned pose. Let the helper handle it.
         StepOutcome {
-            reward: terminal_r + shaping,
+            reward: sparse_reward + shaping,
             done,
             truncated,
             terminal_reward: terminal_r,
