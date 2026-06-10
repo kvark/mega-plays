@@ -19,7 +19,7 @@ use egui::{Color32, Pos2, Rect, Stroke, Vec2};
 use crate::{
     agent::{Agent, AgentConfig},
     env_loop::run_burst,
-    game::{Game, GameSpec},
+    game::{Game, GameSpec, HumanInput},
     stats::{RollingStats, SparkLine},
 };
 
@@ -380,6 +380,9 @@ impl<G: Game + 'static> winit::application::ApplicationHandler for App<G> {
             paused: false,
             show_overlay: true,
             view_mode,
+            human_play: false,
+            human_up: false,
+            human_down: false,
             speed_mul: 1,
             achieved_subs: 0,
             requested_subs: 0,
@@ -432,21 +435,37 @@ impl<G: Game + 'static> winit::application::ApplicationHandler for App<G> {
                 event:
                     KeyEvent {
                         physical_key: PhysicalKey::Code(key),
-                        state: ElementState::Pressed,
+                        state,
                         ..
                     },
                 ..
-            } => match key {
-                KeyCode::Escape => event_loop.exit(),
-                KeyCode::Space => r.paused = !r.paused,
-                KeyCode::KeyG => r.show_overlay = !r.show_overlay,
-                KeyCode::KeyV => r.view_mode = r.view_mode.toggled(),
-                KeyCode::KeyR => r.reset_learning(),
-                KeyCode::KeyT => r.train_epoch(),
-                KeyCode::KeyS => r.save_weights(),
-                KeyCode::KeyL => r.load_weights(),
-                _ => {}
-            },
+            } => {
+                let pressed = matches!(state, ElementState::Pressed);
+                match key {
+                    KeyCode::ArrowUp => r.human_up = pressed,
+                    KeyCode::ArrowDown => r.human_down = pressed,
+                    _ if pressed => match key {
+                        KeyCode::Escape => event_loop.exit(),
+                        KeyCode::Space => r.paused = !r.paused,
+                        KeyCode::KeyG => r.show_overlay = !r.show_overlay,
+                        KeyCode::KeyV => r.view_mode = r.view_mode.toggled(),
+                        KeyCode::KeyR => r.reset_learning(),
+                        KeyCode::KeyT => r.train_epoch(),
+                        KeyCode::KeyS => r.save_weights(),
+                        KeyCode::KeyL => r.load_weights(),
+                        KeyCode::KeyP => {
+                            r.human_play = !r.human_play;
+                            r.set_status(if r.human_play {
+                                "human play: ON (arrow keys control env 0's opponent)".into()
+                            } else {
+                                "human play: OFF".into()
+                            });
+                        }
+                        _ => {}
+                    },
+                    _ => {}
+                }
+            }
             WindowEvent::RedrawRequested => r.redraw(event_loop),
             _ => {}
         }
@@ -518,6 +537,15 @@ struct Running<G: Game> {
     paused: bool,
     show_overlay: bool,
     view_mode: ViewMode,
+    /// True when the user has taken over env 0 with the keyboard. The
+    /// scripted opponent path keeps driving the other envs so the
+    /// agent still trains against a stationary distribution; env 0
+    /// becomes the killer-demo "you vs the live-learning agent".
+    human_play: bool,
+    /// Arrow-key state for the human-play env. Polled each frame, fed
+    /// to env 0 as `HumanInput { axis_y: up - down }`.
+    human_up: bool,
+    human_down: bool,
     /// Speed multiplier from the UI slider. Total substeps per frame
     /// is `base_substeps_per_frame * speed_mul`.
     speed_mul: i32,
@@ -632,6 +660,11 @@ impl<G: Game> Running<G> {
     /// terminated (especially the lander hoverer before truncation
     /// landed). Ties break toward the lowest-index env.
     fn hero_env(&self) -> usize {
+        // Human-play forces env 0 to be the hero — the player must see
+        // the env they're piloting on top of the cloud.
+        if self.human_play {
+            return 0;
+        }
         let n = self.games.len().max(1);
         let last_return = if self.last_return.len() == n {
             &self.last_return[..]
@@ -817,6 +850,23 @@ impl<G: Game> Running<G> {
         self.last_frame = now;
         self.physics_accum += dt;
         self.last_dt = dt;
+
+        // Human-play wiring: feed env 0 the arrow-key axis, hand every
+        // other env a zero so the scripted opponent path stays
+        // stationary for the policy. When the toggle is off, every env
+        // including 0 sees zero — pong's `update_opponent` then takes
+        // the scripted branch.
+        let human = if self.human_play {
+            HumanInput {
+                axis_y: (self.human_up as i32 - self.human_down as i32) as f32,
+                ..Default::default()
+            }
+        } else {
+            HumanInput::default()
+        };
+        for (i, g) in self.games.iter_mut().enumerate() {
+            g.set_human_input(if i == 0 { human } else { HumanInput::default() });
+        }
 
         // Wall-clock-anchored sim speed. `speed_mul = 1` means "physics
         // runs at real time" — the substep count this frame is the
@@ -1139,6 +1189,7 @@ impl<G: Game> Running<G> {
                         let cell_w = rect.width() / cols as f32;
                         let cell_h = rect.height() / rows as f32;
                         let pad = 2.0;
+                        let highlight_human = self.human_play;
                         for (i, g) in self.games.iter().enumerate() {
                             let col = i % cols;
                             let row = i / cols;
@@ -1151,10 +1202,15 @@ impl<G: Game> Running<G> {
                             );
                             let play = fit_rect(cell, play_aspect);
                             g.paint(painter, play, 255);
+                            let (stroke_w, stroke_c) = if highlight_human && i == 0 {
+                                (2.0, Color32::from_rgb(230, 170, 60))
+                            } else {
+                                (1.0, Color32::from_gray(28))
+                            };
                             painter.rect_stroke(
                                 cell,
                                 0.0,
-                                Stroke::new(1.0, Color32::from_gray(28)),
+                                Stroke::new(stroke_w, stroke_c),
                                 egui::StrokeKind::Inside,
                             );
                         }
@@ -1268,6 +1324,23 @@ impl<G: Game> Running<G> {
                     ui.label("view [V]");
                     ui.selectable_value(&mut self.view_mode, ViewMode::Grid, "grid");
                     ui.selectable_value(&mut self.view_mode, ViewMode::Overlay, "overlay");
+                });
+                ui.horizontal(|ui| {
+                    if ui
+                        .selectable_label(self.human_play, "human play [P]")
+                        .on_hover_text(
+                            "Take over env 0's opponent with ↑/↓ — you vs the live-learning agent",
+                        )
+                        .clicked()
+                    {
+                        self.human_play = !self.human_play;
+                    }
+                    if self.human_play {
+                        ui.colored_label(
+                            Color32::from_rgb(220, 170, 60),
+                            "  env 0: ↑/↓ control orange paddle",
+                        );
+                    }
                 });
                 if ui
                     .button(if self.paused {

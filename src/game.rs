@@ -12,6 +12,18 @@
 
 use crate::agent::{Action, Observation};
 
+/// Per-frame human input delivered to *one* env when human play is on.
+/// Games interpret it however they like — pong reads `axis_y` as the
+/// opponent-paddle target. `axis_*` are in `[-1, 1]`; buttons are
+/// instantaneous "is currently held" booleans.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HumanInput {
+    pub axis_y: f32,
+    pub axis_x: f32,
+    pub primary: bool,
+    pub secondary: bool,
+}
+
 /// Tint `c` by `alpha`, preserving its RGB. Used by [`Game::paint`]
 /// implementations to support the alpha-blended overlay view where
 /// every environment is drawn in the same rect; alpha = 255 leaves
@@ -121,4 +133,13 @@ pub trait Game {
     /// e.g. opponent speed for Pong. Called by the auto-curriculum
     /// controller and propagated to all environments.
     fn set_difficulty(&mut self, _level: f32) {}
+
+    /// Hand the env one frame of human input, to be consumed by its
+    /// next step. Default no-op — games that don't expose a human
+    /// channel ignore it. Pong wires the opponent paddle to
+    /// `axis_y`. The driver calls this on the designated "human env"
+    /// (index 0) when human play is toggled on; other envs receive
+    /// the zero default so the agent keeps training against the
+    /// scripted opponent.
+    fn set_human_input(&mut self, _input: HumanInput) {}
 }
