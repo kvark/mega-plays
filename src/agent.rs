@@ -66,6 +66,13 @@ pub struct AgentConfig {
     pub target_tau: f32,
     /// Minimum transitions in the buffer before training starts.
     pub warmup: usize,
+    /// Hold each selected action for this many physics substeps before
+    /// the next decision. Cuts inference round trips proportionally and
+    /// turns ε-greedy into a real exploration signal (sub-perception
+    /// dithering at 120 Hz averages to zero net torque/velocity). The
+    /// recorded transition's reward is the sum across the burst and
+    /// `next_obs` is the post-burst observation.
+    pub action_repeat: u32,
 }
 
 impl Default for AgentConfig {
@@ -81,6 +88,7 @@ impl Default for AgentConfig {
             epsilon_decay_steps: 20_000,
             target_tau: 0.005,
             warmup: 5_000,
+            action_repeat: 4,
         }
     }
 }
@@ -230,6 +238,10 @@ impl Agent {
         self.obs_dim
     }
 
+    pub fn action_repeat(&self) -> u32 {
+        self.cfg.action_repeat.max(1)
+    }
+
     fn init_parameters(&mut self) {
         for p in &self.params {
             let data = if p.name.ends_with(".weight") {
@@ -263,6 +275,18 @@ impl Agent {
     /// ..., envN-1.obs]`, length `num_envs * obs_dim`.
     pub fn select_actions(&mut self, obs_batch: &[f32]) -> Vec<Action> {
         assert_eq!(obs_batch.len(), self.num_envs * self.obs_dim);
+        let eps = self.current_epsilon();
+
+        // During warmup epsilon is pinned at 1.0 — every action is
+        // uniform random, no Q-value is consulted, and the GPU inference
+        // round trip would be discarded. Skip it entirely.
+        if eps >= 1.0 {
+            self.inferences += self.num_envs as u64;
+            return (0..self.num_envs)
+                .map(|_| self.rng.random_range(0..self.num_actions))
+                .collect();
+        }
+
         self.inference.set_input("obs", obs_batch);
         self.inference.step();
         self.inference.wait();
@@ -272,7 +296,6 @@ impl Agent {
         let mut q = vec![0.0_f32; self.num_envs * na];
         self.inference.read_output_by_index(0, &mut q);
 
-        let eps = self.current_epsilon();
         let mut out = Vec::with_capacity(self.num_envs);
         for i in 0..self.num_envs {
             let a = if self.rng.random::<f32>() < eps {

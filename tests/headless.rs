@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use mega_plays::{
     agent::{Agent, AgentConfig, Transition},
-    env_loop::run_substep,
+    env_loop::run_burst,
     game::Game,
     pong::PongGame,
 };
@@ -35,13 +35,16 @@ fn train_headless<G: Game>(
     let mut losses = 0u64;
     let mut dones_no_terminal = 0u64;
 
+    let action_repeat = agent.action_repeat();
+    let bursts = (substeps / action_repeat.max(1)).max(1);
     for _ in 0..frames {
-        for _ in 0..substeps {
-            run_substep(
+        for _ in 0..bursts {
+            run_burst(
                 agent,
                 games,
                 &mut obs_buf,
                 obs_dim,
+                action_repeat,
                 |i, _action, outcome| {
                     episode_return[i] += outcome.reward;
                     if outcome.done {

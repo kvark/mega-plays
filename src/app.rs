@@ -18,7 +18,7 @@ use egui::{Color32, Pos2, Rect, Stroke, Vec2};
 
 use crate::{
     agent::{Agent, AgentConfig},
-    env_loop::run_substep,
+    env_loop::run_burst,
     game::{Game, GameSpec},
     stats::{RollingStats, SparkLine},
 };
@@ -154,11 +154,20 @@ where
         num_envs
     );
 
+    let action_repeat = agent.action_repeat();
+    let bursts_per_frame = (config.base_substeps_per_frame / action_repeat).max(1);
     for frame in 0..frames {
         let _tick = tracing::info_span!("tick").entered();
-        for _ in 0..config.base_substeps_per_frame {
+        for _ in 0..bursts_per_frame {
             let _sub = tracing::info_span!("substep").entered();
-            run_substep(&mut agent, &mut games, &mut obs_buf, obs_dim, |_, _, _| {});
+            run_burst(
+                &mut agent,
+                &mut games,
+                &mut obs_buf,
+                obs_dim,
+                action_repeat,
+                |_, _, _| {},
+            );
         }
         let _train = tracing::info_span!("train").entered();
         for _ in 0..config.train_steps_per_frame {
@@ -563,13 +572,16 @@ impl<G: Game> Running<G> {
         }
 
         // Process a small chunk per redraw to keep the UI responsive.
-        // Each frame does `substeps` inference passes + `train_steps`
+        // Each frame does `substeps` worth of physics in bursts of
+        // `action_repeat` substeps per inference + `train_steps`
         // gradient steps, so even 10 frames can take tens of ms.
-        let substeps = self.config.base_substeps_per_frame;
+        let action_repeat = self.agent.action_repeat();
+        let bursts_per_frame =
+            (self.config.base_substeps_per_frame / action_repeat.max(1)).max(1);
         let train_steps = self.config.train_steps_per_frame;
         let chunk = self.epoch_remaining.min(10);
         for _ in 0..chunk {
-            for _ in 0..substeps {
+            for _ in 0..bursts_per_frame {
                 let agent = &mut self.agent;
                 let games = &mut self.games;
                 let episode_return = &mut self.episode_return;
@@ -579,11 +591,12 @@ impl<G: Game> Running<G> {
                 let win_rate_ema = &mut self.win_rate_ema;
                 let episode_return_hist = &mut self.episode_return_hist;
                 let return_ema = &mut self.return_ema;
-                run_substep(
+                run_burst(
                     agent,
                     games,
                     &mut obs_buf,
                     obs_dim,
+                    action_repeat,
                     |i, _action, outcome| {
                         episode_return[i] += outcome.reward;
                         episode_len[i] += 1;
@@ -678,25 +691,27 @@ impl<G: Game> Running<G> {
             self.episode_len = vec![0; self.games.len()];
         }
 
-        if self.paused {
-            return;
-        }
-
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f32().min(0.1);
         self.last_frame = now;
         self.physics_accum += dt;
 
-        // Number of substeps this frame: base * slider, but capped by
-        // how much wall-clock dt has actually accumulated so the
-        // display doesn't lie about the simulation rate.
-        let total_subs =
-            (self.config.base_substeps_per_frame as i32 * self.speed_mul).max(1) as u32;
+        // Pause stops physics but training keeps draining replay below.
+        // Substeps per frame: base × slider. We hold the same action for
+        // `action_repeat` substeps, so each frame issues `bursts` GPU
+        // inference round trips instead of `total_subs`.
+        let total_subs = if self.paused {
+            0
+        } else {
+            (self.config.base_substeps_per_frame as i32 * self.speed_mul).max(1) as u32
+        };
+        let action_repeat = self.agent.action_repeat();
+        let bursts = total_subs / action_repeat.max(1);
         let obs_dim = self.spec.obs_dim;
         let num_envs = self.games.len();
         let mut obs_buf = vec![0.0_f32; num_envs * obs_dim];
 
-        for _ in 0..total_subs {
+        for _ in 0..bursts {
             let _sub = tracing::info_span!("substep").entered();
             // Split borrows so the closure can mutate every stat field
             // independently of `agent` and `games`.
@@ -713,30 +728,40 @@ impl<G: Game> Running<G> {
             let episode_len_hist = &mut self.episode_len_hist;
             let return_ema = &mut self.return_ema;
             let hist_slots = action_hist.len();
-            run_substep(agent, games, &mut obs_buf, obs_dim, |i, action, outcome| {
-                episode_return[i] += outcome.reward;
-                episode_len[i] += 1;
-                if (action as usize) < hist_slots {
-                    action_hist[action as usize] += 1;
-                }
-                reward_hist.push(outcome.reward);
-                if outcome.done {
-                    let agent_won = outcome.terminal_reward > 0.0;
-                    if agent_won {
-                        *scores_agent += 1;
-                    } else if outcome.terminal_reward < 0.0 {
-                        *scores_opp += 1;
+            run_burst(
+                agent,
+                games,
+                &mut obs_buf,
+                obs_dim,
+                action_repeat,
+                |i, action, outcome| {
+                    episode_return[i] += outcome.reward;
+                    episode_len[i] += 1;
+                    if (action as usize) < hist_slots {
+                        action_hist[action as usize] += 1;
                     }
-                    *win_rate_ema = ema(*win_rate_ema, if agent_won { 1.0 } else { 0.0 }, 0.02);
-                    let ret = episode_return[i];
-                    episode_return_hist.push(ret);
-                    *return_ema = ema(*return_ema, ret, 0.02);
-                    episode_len_hist.push(episode_len[i] as f32);
-                    episode_return[i] = 0.0;
-                    episode_len[i] = 0;
-                }
-            });
-            self.physics_accum = (self.physics_accum - self.spec.physics_dt).max(0.0);
+                    reward_hist.push(outcome.reward);
+                    if outcome.done {
+                        let agent_won = outcome.terminal_reward > 0.0;
+                        if agent_won {
+                            *scores_agent += 1;
+                        } else if outcome.terminal_reward < 0.0 {
+                            *scores_opp += 1;
+                        }
+                        *win_rate_ema =
+                            ema(*win_rate_ema, if agent_won { 1.0 } else { 0.0 }, 0.02);
+                        let ret = episode_return[i];
+                        episode_return_hist.push(ret);
+                        *return_ema = ema(*return_ema, ret, 0.02);
+                        episode_len_hist.push(episode_len[i] as f32);
+                        episode_return[i] = 0.0;
+                        episode_len[i] = 0;
+                    }
+                },
+            );
+            self.physics_accum = (self.physics_accum
+                - self.spec.physics_dt * action_repeat as f32)
+                .max(0.0);
         }
 
         // Auto-curriculum: increase difficulty when the agent is
@@ -744,7 +769,7 @@ impl<G: Game> Running<G> {
         // difficulty below the starting value, so early random play
         // doesn't collapse the opponent to trivial.
         let total_episodes = self.scores_agent + self.scores_opp;
-        if self.auto_difficulty && total_episodes >= 50 {
+        if !self.paused && self.auto_difficulty && total_episodes >= 50 {
             let actual_wr = self.scores_agent as f32 / total_episodes as f32;
             let target_wr = self.target_win_ratio / (1.0 + self.target_win_ratio);
             if actual_wr > target_wr {
@@ -759,9 +784,16 @@ impl<G: Game> Running<G> {
             }
         }
 
+        // Training continues even when physics is paused — that's what
+        // makes pause genuinely useful for "stop the action, let the
+        // network finish chewing on what it just saw". Scale by the
+        // requested sim speed so the slider also accelerates learning.
+        let train_steps = if self.paused {
+            self.config.train_steps_per_frame
+        } else {
+            self.config.train_steps_per_frame * total_subs / self.config.base_substeps_per_frame
+        };
         let _train = tracing::info_span!("train").entered();
-        let train_steps =
-            self.config.train_steps_per_frame * total_subs / self.config.base_substeps_per_frame;
         for _ in 0..train_steps {
             if let Some(loss) = {
                 let _s = tracing::info_span!("train_step").entered();
