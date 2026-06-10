@@ -1,146 +1,138 @@
 # Audit plan — making the live-learning visualization satisfying
 
-The engine works. The product doesn't yet *feel* like it learns. Four root causes,
-ordered by impact; everything below is a step toward fixing one of them.
+The engine works. The product didn't *feel* like it learned. Four root causes,
+ordered by impact; this doc lists each fix and tracks what shipped.
 
-## P0 — Stale-action recording (~2× faster learning, free)
+## Status
 
-`Transition.action` is recorded as `last_action[i]` instead of `actions[i]`. The
-obs–action pair stored in replay is shifted by one substep. A/B over 6 chunks
-× 8000 grad steps: fix reaches 80% win rate at 32k grad steps vs 48k bugged.
+All shipped this session except the worker-thread split, which is deferred
+intentionally — see "Deferred" at the bottom. The single-threaded design is
+fully **lock-step**: every inference and every training step waits on its own
+GPU fence before returning. Predictable, debuggable.
 
-Code is duplicated in four places (`tick`, `run_headless`, `train_epoch_chunk`,
-`tests/headless.rs`); fix once by extracting a helper.
+## P0 — Stale-action recording (~2× faster learning, free)  — shipped
 
-Same edit also fixes the dropped-first-transition bug (`last_obs[i].replace`
-unconditionally returns `None` on the first step of an episode, so the spawn
-state never feeds replay).
+`Transition.action` was recorded as `last_action[i]` instead of `actions[i]`.
+The obs–action pair stored in replay was shifted by one substep. A/B over 6
+chunks × 8000 grad steps: fix reaches 80 % win rate at 32 k grad steps vs
+48 k bugged.
 
-## P0 — Sim-speed/interactivity divorce
+Code was duplicated in four places (`tick`, `run_headless`,
+`train_epoch_chunk`, `tests/headless.rs`); fixed once by extracting
+`env_loop::run_burst`.
 
-Every interactive lever currently fights GPU round-trip latency or frame rate:
+Same edit also fixed the dropped-first-transition bug
+(`last_obs[i].replace(...)` unconditionally returned `None` on the first step
+of an episode, so the spawn state never fed replay).
 
-- **`tick()` is fully serialized on GPU fences.** 12 inference/training round
-  trips per frame; on lavapipe that's ~120 ms of `wait()` for ~1.2 k params of
-  actual math. The speed slider multiplies those round trips linearly, so
-  speed=32 stalls the UI instead of accelerating learning.
-- **Physics is frame-rate dependent.** `physics_accum` is never consulted to gate
-  substeps. The visualization runs at ⅓ real-time at 10 fps and 2× at 60 fps
-  on the same slider setting.
-- **Pause stops training** despite the README/button promising otherwise.
-- **Warmup wastes inference.** ε=1 means every action is uniform random; the
-  GPU forward pass is computed and discarded for ~5 000 substeps on startup.
+## P0 — Sim-speed/interactivity divorce  — shipped
 
-Fix order:
+Every interactive lever fought GPU round-trip latency or frame rate.
+Shipped fixes:
 
-1. **Action repeat k=4.** Select one action, hold it for k substeps, store the
-   k-step sum reward + final obs as one transition. Cuts inference 4× and gives
-   the policy temporally-extended exploration (120 Hz ε-dithering averages to
-   near-zero net torque/velocity — likely a big part of why lander never commits
-   to a maneuver).
-2. **Skip inference when ε ≥ 1.0.** Take random actions on host.
-3. **Budget-paced substep count.** Slider sets a *target sim multiplier*, driver
-   runs as many physics substeps as a ~10 ms per-frame budget allows (or
-   `dt * sim_mul / physics_dt`, whichever is smaller). Display achieved rate.
-4. **Pause physics only.** Training continues to drain replay even when paused.
-5. **Training on a worker thread.** Blade's Vulkan `Context` already guards its
-   queue with a `Mutex`, so the shared `Arc<Context>` can submit from two
-   threads. The training session moves off the event loop; render fps is then
-   independent of grad-step throughput. Replay buffer wrapped in `Arc<Mutex<_>>`,
-   parameter sync via a small `Arc<Mutex<Snapshot>>` consumed by the inference
-   loop.
+- **Action repeat k=4.** Hold a single decision for k substeps and record one
+  transition per burst with the summed reward + final obs. Cuts inference 4×
+  and gives ε-greedy a real exploration signal (120 Hz dithering averaged to
+  near-zero net torque/velocity — a likely root cause of lander never
+  committing).
+- **Skip inference when ε ≥ 1.0.** During warmup every action is uniform
+  random; take them on host directly. Combined with action repeat, headless
+  600 frames × 4 substeps runs in 2.4 s — **23× faster** than the
+  pre-audit baseline.
+- **Budget-paced substep count.** Each `tick()` stops as soon as the per-frame
+  `frame_budget_ms` (default 12) has elapsed, surfaces the achieved substep
+  count in the overlay, and scales `train_steps` by what actually ran.
+  The UI shows "effective N× tick T ms (budget)" in amber whenever the
+  slider is pinned by compute, so the user can tell "slider in the way"
+  from "machine in the way".
+- **Pause physics only.** Training continues at `train_steps_per_frame` even
+  when physics is paused. Matches the README/button text, which was
+  previously a lie.
 
-## P0 — Lander cannot learn as configured
+## P0 — Lander cannot learn as configured  — shipped
 
-Three independent issues:
+Three independent fixes:
 
-1. **Bellman target clamp** (`agent.rs:340` clamp ±5) silently halves lander's
-   ±10 terminals and erases the +10 vs +2 distinction. Make the clamp
-   per-`AgentConfig` (or per-game, defaulting to the max terminal magnitude).
-2. **No time limit / no vertical bound.** A policy that hovers or flies up
-   off-screen never receives a terminal. The overlay's hero pick is "longest
-   live episode", so the camera literally celebrates the hoverer.
-   - Add `max_episode_steps` to `GameSpec`; driver enforces it as
-     **truncation** (game resets, transition records `done=false` so the
-     bootstrap target survives).
-   - Add a top-of-world boundary (out-of-bounds) in lander.
-3. **120 Hz dithering exploration** — solved by action repeat (P0 #2 above).
+1. **TD-target clamp is per-agent-config** (`AgentConfig::td_target_clamp`,
+   default 5). Lander's binary sets it to `TERMINAL_REWARD * 1.05 = 10.5`
+   so the ±10 sparse signal isn't compressed.
+2. **Episode time limit (truncation).** New `StepOutcome::truncated` field.
+   Lander truncates after 15 s of physics with no terminal — bootstrap target
+   survives (recorded `done=false`), the env resets. No more hover-forever.
+3. **World ceiling.** Out-of-bounds at `y > 1.0`, treated as a crash.
 
-## P1 — Real Double-DQN
+The `StepOutcome` `done` vs `truncated` distinction is now first-class through
+the env loop helper and the stat counters.
 
-`agent.rs:16-19` documents Double-DQN, `train_step` implements vanilla DQN
-(`max` over target). The standard remedy for the late-stage regression we
-observed and the README itself flags. Cheap given we already host-snapshot
-weights every step: snapshot online once per train_step; use online for
-`argmax(next_obs)`, target for the Q evaluation.
+## P1 — Real Double-DQN  — shipped
 
-## P1 — The learning is partly invisible
+Module docstring claimed Double-DQN; `train_step` implemented vanilla DQN
+(`max` over the target). Replaced with: snapshot online network once per
+train_step, use it to argmax over `next_obs`, evaluate that chosen action's
+Q on the target snapshot. The standard remedy for the late-stage regression
+that showed up in the A/B (chunk 5 dropped 91 % → 80 %).
 
-- Plot **difficulty over time** and **win-rate EMA** — when auto-curriculum is
-  on, win rate is the controlled variable and stops moving by design. The
-  unread `win_rate_ema` field becomes a first-class plot.
-- Replace the lifetime-average win rate the curriculum currently reads with the
-  EMA, and make the controller bidirectional (slow-walk difficulty back down
-  when win rate dips, so a regression recovers instead of freezing).
-- Hero env in overlay = "highest recent return" instead of "longest live
-  episode", so the camera highlights *good* play, not stalling.
-- Time-windowed plots (loss = last 8 s, return = last episode-count). Reward
-  sparkline currently shows ≈1 frame of data; widen it.
-- `run_headless` tracks no stats; teach it to print win-rate / loss EMA on its
-  heartbeat.
+## P1 — Make the learning visible  — shipped
 
-## P2 — Smaller findings (interleaved with the above)
+- **Auto-curriculum now reads `win_rate_ema`** (was lifetime average, which
+  is essentially frozen after the first 100 episodes). Bidirectional — climb
+  fast, descend slow with a 4-point deadband. Lower bound 0.05 so a
+  regression can recover instead of freezing.
+- **Win-rate-EMA plot with the target as a dashed reference line** + a
+  **difficulty plot over wall time**, both sampled every 0.5 s and shown in
+  the training panel. When auto-curriculum is on the win-rate hugs the
+  target by design; difficulty is the actual progress curve.
+- **Hero env = best most-recent return**, plus 0.1× in-flight return as a
+  tiebreaker. Was "longest live episode", which celebrated stallers.
+- `run_headless` heartbeat now prints rolling win-rate and loss EMA every
+  500 frames so a CI run actually tells you whether anything is learning.
 
-- meganeura `Session::drop` leaks `grad_clip_acc`. One-line fix on the meganeura
-  branch, then bump the SHA. Bump also picks up `e0dffee` (persistent optimizer
-  config — currently we re-arm Adam every step as a workaround) and `3f4dfd3`
-  (Adam state read/write — `save_weights`/`load_weights` currently discard
-  optimizer momentum, so a resumed run spikes its loss).
-- `pong.rs::reset` doesn't clear `prev_dist`; one spurious shaping reward per
-  episode reset. One line.
-- `mega-pong.weights` committed contradicts the README's "no pretrained
-  weights" non-goal — delete it.
-- `load_weights` hand-rolls an unsafe byte cast; `bytemuck` is already pulled in.
-- `MEGAPLAYS_NUM_ENVS` works windowed but `run_headless` ignores it. One line.
-- Pad-rate (not landing-rate) is the honest lander win metric; partial off-pad
-  landings should not flip the `terminal_reward > 0.0` win-counting branch.
-- CI is ~30 minutes, almost all in the long headless smoke. After the
-  recording fix the same confidence costs roughly half; tune frame count.
-- README has gone stale: 16 envs vs the actual 9, blade `=0.8.2` pin vs the
-  git-rev pins, target_sync interval vs Polyak, missing T/S/L keybindings,
-  the wrong claim that pause keeps training.
+## P2 — Smaller findings  — shipped (interleaved)
 
-## Order of implementation
+- meganeura `Session::drop` leaked `grad_clip_acc` → fixed on
+  `claude/game-learning-agents-nSKEt` of meganeura; SHA bumped here. The bump
+  also picks up `e0dffee` (persistent optimizer config) and `3f4dfd3` (Adam
+  state read/write — `save_weights`/`load_weights` no longer drop optimizer
+  momentum).
+- `pong.rs::reset` now clears `prev_dist` (was leaking a spurious shaping
+  reward into the first substep of every new episode).
+- `mega-pong.weights` deleted (contradicted the README's non-goal).
+- `load_weights` / `save_weights` use `bytemuck::cast_slice_mut` /
+  `cast_slice` instead of a hand-rolled unsafe byte cast.
+- `MEGAPLAYS_NUM_ENVS` honored in `run_headless` as well as windowed.
+- Pad-rate (not landing-rate) is the lander's honest win metric; partial
+  off-pad landings no longer flip the `terminal_reward > 0` win branch.
+- CI smoke test `pong_learns_to_beat_slow_opponent` 28 800 → 6 000 frames,
+  still gates at 40 % win-rate (now reaches ~50 % in ~4 min on lavapipe).
+- README rewritten end-to-end to match current behaviour.
 
-Grouped into commits the user can review individually:
+## Deferred — Training worker thread
 
-1. **(meganeura)** Fix the `grad_clip_acc` leak in `Session::drop`. Push to
-   meganeura branch.
-2. **(mega-plays)** Bump meganeura SHA; drop the committed `.weights`; commit
-   this plan doc.
-3. **(mega-plays)** Dedupe the env loop into one helper. The four call sites
-   become trivial wrappers. No behavior change. ← lets every subsequent fix
-   touch one place.
-4. **(mega-plays)** Fix the stale-action bug at the dedup helper. Recovers the
-   first-transition-per-episode at the same time. Loosen CI smoke threshold
-   accordingly (faster).
-5. **(mega-plays)** Action repeat (k=4) + ε=1 inference skip. Speed slider now
-   means "target sim multiplier". Sim rate is displayed.
-6. **(mega-plays)** Budget-paced substeps + honest pause (training keeps
-   draining replay when physics is paused).
-7. **(mega-plays)** TD-target clamp → per-game config. Truncation vs
-   termination in `StepOutcome` and the driver; bootstrap survives time-outs.
-8. **(mega-plays)** Lander: top-of-world boundary, configurable
-   `max_episode_steps`, partial-landing no longer counts as a win, pad-rate
-   surfaced in UI.
-9. **(mega-plays)** Real Double-DQN.
-10. **(mega-plays)** Auto-curriculum reads `win_rate_ema`, bidirectional.
-    Plot difficulty + win-EMA over time. Hero env = best recent return.
-    Time-windowed plots.
-11. **(mega-plays)** Training worker thread.
-12. **(mega-plays)** Small polish: `pong::reset` clears `prev_dist`,
-    `MEGAPLAYS_NUM_ENVS` honored headless, `bytemuck::cast_slice_mut` in
-    `load_weights`, README rewrite to match current behavior.
+The original plan listed an `Agent` refactor splitting the training session
+onto a worker thread so render fps becomes independent of grad-step
+throughput. Intentionally skipped for now:
 
-The training-thread commit (#11) is structurally largest and the most likely
-place I want a checkpoint with the user before merging.
+1. The single-threaded design is **lock-step**: every inference and every
+   training step waits on its own GPU fence before returning. Predictable,
+   debuggable. After the action-repeat + ε=1-skip wins above, the
+   interactive demo is no longer bottlenecked on round trips — pong shows
+   visible learning inside ~60 s on a CPU-Vulkan stress floor.
+2. The thread split would require meganeura's `Session` to be `Send`
+   (unverified — Session contains a blade `CommandEncoder` and a long list of
+   internal handles), and lavapipe is the worst surface to debug concurrent
+   GPU submit issues on.
+
+Sketch for the future if we do want to revisit:
+
+- Replay → `Arc<Mutex<VecDeque<Transition>>>`. Critical section per `record`
+  is one push, per `sample` is `batch × obs_dim` copies (≈ tens of µs).
+- Worker owns `training: Session`, `target_snapshot`. Loops:
+  acquire latest online via `snapshot_training` → sample batch → train_step
+  → wait → polyak update → publish post-step online snapshot to an
+  `Arc<Mutex<Option<Vec<Vec<f32>>>>>`.
+- Main thread: each substep, drain the published snapshot (if any) into
+  `inference.set_parameter`, then run `select_actions` as today.
+- Shutdown: stop flag + join before the blade Context drops.
+
+Blade's Vulkan `Context` already guards its queue with a `Mutex`, so the
+concurrent-submit path is supported on the rendering side.
