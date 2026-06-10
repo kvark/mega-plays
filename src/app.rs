@@ -713,15 +713,17 @@ impl<G: Game> Running<G> {
                     |i, _action, outcome| {
                         episode_return[i] += outcome.reward;
                         episode_len[i] += 1;
-                        if outcome.done {
-                            let agent_won = outcome.terminal_reward > 0.0;
-                            if agent_won {
-                                *scores_agent += 1;
-                            } else if outcome.terminal_reward < 0.0 {
-                                *scores_opp += 1;
+                        if outcome.done || outcome.truncated {
+                            if outcome.done {
+                                let agent_won = outcome.terminal_reward > 0.0;
+                                if agent_won {
+                                    *scores_agent += 1;
+                                } else if outcome.terminal_reward < 0.0 {
+                                    *scores_opp += 1;
+                                }
+                                *win_rate_ema =
+                                    ema(*win_rate_ema, if agent_won { 1.0 } else { 0.0 }, 0.02);
                             }
-                            *win_rate_ema =
-                                ema(*win_rate_ema, if agent_won { 1.0 } else { 0.0 }, 0.02);
                             episode_return_hist.push(episode_return[i]);
                             *return_ema = ema(*return_ema, episode_return[i], 0.02);
                             episode_return[i] = 0.0;
