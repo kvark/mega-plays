@@ -162,6 +162,11 @@ where
 
     let action_repeat = agent.action_repeat();
     let bursts_per_frame = (config.base_substeps_per_frame / action_repeat).max(1);
+    let mut wins = 0u64;
+    let mut losses = 0u64;
+    let mut last_print_wins = 0u64;
+    let mut last_print_losses = 0u64;
+    let mut loss_ema = 0.0f32;
     for frame in 0..frames {
         let _tick = tracing::info_span!("tick").entered();
         for _ in 0..bursts_per_frame {
@@ -172,24 +177,53 @@ where
                 &mut obs_buf,
                 obs_dim,
                 action_repeat,
-                |_, _, _| {},
+                |_, _, outcome| {
+                    if outcome.done {
+                        if outcome.terminal_reward > 0.0 {
+                            wins += 1;
+                        } else if outcome.terminal_reward < 0.0 {
+                            losses += 1;
+                        }
+                    }
+                },
             );
         }
         let _train = tracing::info_span!("train").entered();
         for _ in 0..config.train_steps_per_frame {
             let _s = tracing::info_span!("train_step").entered();
-            if agent.train_step().is_none() {
+            if let Some(loss) = agent.train_step() {
+                loss_ema = if loss_ema == 0.0 {
+                    loss
+                } else {
+                    loss_ema * 0.99 + loss * 0.01
+                };
+            } else {
                 break;
             }
         }
         if frame.is_multiple_of(500) {
+            let interval_wins = wins - last_print_wins;
+            let interval_losses = losses - last_print_losses;
+            let interval_total = interval_wins + interval_losses;
+            let interval_wr = if interval_total > 0 {
+                100.0 * interval_wins as f32 / interval_total as f32
+            } else {
+                0.0
+            };
             log::info!(
-                "headless frame {} / {}  ({:.1}s elapsed, replay={})",
+                "headless frame {} / {}  {:.1}s  replay={} grad={} eps={:.3} \
+                 wr_last_window={:.1}% loss_ema={:.4}",
                 frame,
                 frames,
                 start.elapsed().as_secs_f32(),
-                agent.replay_len()
+                agent.replay_len(),
+                agent.gradient_steps,
+                agent.current_epsilon(),
+                interval_wr,
+                loss_ema,
             );
+            last_print_wins = wins;
+            last_print_losses = losses;
         }
     }
     log::info!(
@@ -313,6 +347,9 @@ impl<G: Game + 'static> winit::application::ApplicationHandler for App<G> {
             episode_return_hist: RollingStats::new(200),
             episode_len: Vec::new(),
             episode_len_hist: RollingStats::new(200),
+            win_rate_hist: RollingStats::new(400),
+            difficulty_hist: RollingStats::new(400),
+            last_sample_time: now,
             scores_agent: 0,
             scores_opp: 0,
             last_return: Vec::new(),
@@ -429,6 +466,17 @@ struct Running<G: Game> {
     episode_return_hist: RollingStats,
     episode_len: Vec<u32>,
     episode_len_hist: RollingStats,
+    /// Sampled `win_rate_ema` and `difficulty` over wall time. Each
+    /// sample is one tick of `sample_interval` (default 0.5 s), so the
+    /// plot's x-axis is naturally time-scoped. The win-rate trace is
+    /// what the auto-curriculum reads — when the curve hugs the dashed
+    /// `target_win_ratio` line the controller is doing its job and
+    /// `win_rate` will look stationary by design (this is the trace to
+    /// watch instead).
+    win_rate_hist: RollingStats,
+    difficulty_hist: RollingStats,
+    /// Wall-clock time of the last (win_rate, difficulty) sample push.
+    last_sample_time: Instant,
     scores_agent: u64,
     scores_opp: u64,
     /// Per-env total reward from the most recently completed episode.
@@ -537,6 +585,9 @@ impl<G: Game> Running<G> {
         self.loss_hist = RollingStats::new(400);
         self.reward_hist = RollingStats::new(400);
         self.episode_return_hist = RollingStats::new(200);
+        self.win_rate_hist = RollingStats::new(400);
+        self.difficulty_hist = RollingStats::new(400);
+        self.last_sample_time = Instant::now();
         self.loss_ema = 0.0;
         self.return_ema = 0.0;
         self.scores_agent = 0;
@@ -829,24 +880,49 @@ impl<G: Game> Running<G> {
         self.achieved_subs = achieved_subs;
         self.requested_subs = bursts_requested * action_repeat;
 
-        // Auto-curriculum: increase difficulty when the agent is
-        // winning too much. One-directional ratchet — never reduces
-        // difficulty below the starting value, so early random play
-        // doesn't collapse the opponent to trivial.
+        // Auto-curriculum: keep `win_rate_ema` close to `target_wr`.
+        // Bidirectional — when the agent is winning we make the game
+        // harder; when it's losing (e.g. after a policy regression) we
+        // walk the difficulty back down. The asymmetric rates favour
+        // climbing because exploration noise alone can push wr below
+        // target for a few episodes. EMA-driven, not lifetime-averaged
+        // (that one only updates ~1% per episode after the first 100,
+        // i.e. essentially never).
         let total_episodes = self.scores_agent + self.scores_opp;
-        if !self.paused && self.auto_difficulty && total_episodes >= 50 {
-            let actual_wr = self.scores_agent as f32 / total_episodes as f32;
+        if !self.paused && self.auto_difficulty && total_episodes >= 30 {
             let target_wr = self.target_win_ratio / (1.0 + self.target_win_ratio);
-            if actual_wr > target_wr {
-                let excess = actual_wr - target_wr;
-                let rate = excess * 0.12 * dt;
-                let adj = (1.0 + rate).clamp(1.0, 1.005);
-                let d = self.games[0].difficulty();
-                let new_d = (d * adj).min(3.0);
+            let err = self.win_rate_ema - target_wr;
+            const DEADBAND: f32 = 0.04;
+            let d = self.games[0].difficulty();
+            let new_d = if err > DEADBAND {
+                let adj = (1.0 + err * 0.20 * dt).clamp(1.0, 1.010);
+                (d * adj).min(3.0)
+            } else if err < -DEADBAND {
+                let adj = (1.0 + err * 0.10 * dt).clamp(0.992, 1.0);
+                (d * adj).max(0.05)
+            } else {
+                d
+            };
+            if (new_d - d).abs() > f32::EPSILON {
                 for g in &mut self.games {
                     g.set_difficulty(new_d);
                 }
             }
+        }
+
+        // Sample win-rate-EMA and difficulty into time-windowed plots
+        // every `sample_interval` of wall time. 0.5 s × 400 capacity =
+        // ~3 minutes of training visible at a glance.
+        const SAMPLE_INTERVAL_SECS: f32 = 0.5;
+        if tick_start
+            .duration_since(self.last_sample_time)
+            .as_secs_f32()
+            >= SAMPLE_INTERVAL_SECS
+        {
+            self.win_rate_hist.push(self.win_rate_ema);
+            let cur_difficulty = self.games.first().map_or(0.0, |g| g.difficulty());
+            self.difficulty_hist.push(cur_difficulty);
+            self.last_sample_time = tick_start;
         }
 
         // Training continues even when physics is paused — that's what
@@ -1277,10 +1353,44 @@ impl<G: Game> Running<G> {
                     0.0
                 };
                 ui.label(format!(
-                    "win rate        {:>5.1}%  difficulty {:.2}",
+                    "win rate        {:>5.1}%  (EMA {:.1}%)  difficulty {:.2}",
                     wr * 100.0,
+                    self.win_rate_ema * 100.0,
                     self.games[0].difficulty(),
                 ));
+
+                // Win-rate EMA + difficulty over time. When
+                // auto-curriculum is on, win-rate is the *controlled*
+                // variable — by design it stays near `target_wr`, so
+                // the live signal is whether the controller can keep it
+                // there *and* whether difficulty is climbing. Both
+                // tracks share the same x-axis (wall time) and the
+                // dashed target line shows where the controller is
+                // pulling.
+                ui.horizontal(|ui| {
+                    ui.label("win-rate EMA (target dashed)");
+                });
+                let (wr_rect, _) =
+                    ui.allocate_exact_size(Vec2::new(260.0, 50.0), egui::Sense::hover());
+                let target_wr = self.target_win_ratio / (1.0 + self.target_win_ratio);
+                draw_plot_with_marker(
+                    ui.painter(),
+                    wr_rect,
+                    &self.win_rate_hist,
+                    Color32::from_rgb(120, 220, 200),
+                    Some(target_wr),
+                    (0.0, 1.0),
+                );
+                ui.label("difficulty over wall time");
+                let (df_rect, _) =
+                    ui.allocate_exact_size(Vec2::new(260.0, 40.0), egui::Sense::hover());
+                draw_plot(
+                    ui.painter(),
+                    df_rect,
+                    &self.difficulty_hist,
+                    Color32::from_rgb(230, 180, 120),
+                    false,
+                );
 
                 ui.separator();
                 if ui.button("quit [Esc]").clicked() {
@@ -1480,4 +1590,53 @@ fn draw_plot(
         font,
         label_color,
     );
+}
+
+/// Plot a [0,1]-bounded trace (e.g. win-rate EMA) with a fixed y range
+/// and a dashed reference marker (the target the controller is pulling
+/// the trace toward). Avoids `draw_plot`'s auto-scaling, which would
+/// crush the visible variation when the trace hugs the target.
+fn draw_plot_with_marker(
+    painter: &egui::Painter,
+    rect: Rect,
+    stats: &RollingStats,
+    color: Color32,
+    marker: Option<f32>,
+    (lo, hi): (f32, f32),
+) {
+    painter.rect_filled(rect, 0.0, Color32::from_black_alpha(120));
+    let grid = Stroke::new(0.5, Color32::from_gray(40));
+    for i in 1..4 {
+        let y = rect.min.y + rect.height() * i as f32 / 4.0;
+        painter.line_segment([Pos2::new(rect.min.x, y), Pos2::new(rect.max.x, y)], grid);
+    }
+    let span = (hi - lo).max(1e-6);
+    if let Some(m) = marker {
+        let y = rect.min.y + (1.0 - (m - lo) / span) * rect.height();
+        let dash_w = 5.0;
+        let gap = 4.0;
+        let mut x = rect.min.x;
+        while x < rect.max.x {
+            let x2 = (x + dash_w).min(rect.max.x);
+            painter.line_segment(
+                [Pos2::new(x, y), Pos2::new(x2, y)],
+                Stroke::new(1.0, Color32::from_rgb(200, 200, 90)),
+            );
+            x += dash_w + gap;
+        }
+    }
+    if stats.len() < 2 {
+        return;
+    }
+    let n = stats.len().max(1) - 1;
+    let mut prev: Option<Pos2> = None;
+    for (i, v) in stats.iter().enumerate() {
+        let t = i as f32 / n as f32;
+        let y = 1.0 - (v.clamp(lo, hi) - lo) / span;
+        let p = rect.min + Vec2::new(t * rect.width(), y * rect.height());
+        if let Some(a) = prev {
+            painter.line_segment([a, p], Stroke::new(1.2, color));
+        }
+        prev = Some(p);
+    }
 }
