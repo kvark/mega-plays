@@ -17,7 +17,8 @@ use blade_graphics as gpu;
 use egui::{Color32, Pos2, Rect, Stroke, Vec2};
 
 use crate::{
-    agent::{Agent, AgentConfig, Transition},
+    agent::{Agent, AgentConfig},
+    env_loop::run_substep,
     game::{Game, GameSpec},
     stats::{RollingStats, SparkLine},
 };
@@ -104,7 +105,7 @@ type Builder<G> = Box<dyn FnMut(Arc<gpu::Context>) -> G>;
 /// runners, headless Linux servers) — everything except rendering
 /// still happens, so the resulting `.pftrace` has CPU spans and
 /// meganeura GPU dispatches on the same tracks as a windowed run.
-fn run_headless<G, F>(config: AppConfig, mut build_game: F, frames: u32)
+fn run_headless<G, F>(mut config: AppConfig, mut build_game: F, frames: u32)
 where
     G: Game + 'static,
     F: FnMut(Arc<gpu::Context>) -> G + 'static,
@@ -121,6 +122,13 @@ where
     .expect("init Blade context (headless)");
     let gpu = Arc::new(gpu);
 
+    if let Some(n) = std::env::var("MEGAPLAYS_NUM_ENVS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        config.num_envs = n.max(1);
+    }
+
     let mut games: Vec<G> = (0..config.num_envs)
         .map(|_| build_game(gpu.clone()))
         .collect();
@@ -136,8 +144,6 @@ where
 
     let num_envs = games.len();
     let obs_dim = spec.obs_dim;
-    let mut last_obs: Vec<Option<Vec<f32>>> = vec![None; num_envs];
-    let mut last_action: Vec<crate::agent::Action> = vec![0; num_envs];
     let mut obs_buf = vec![0.0_f32; num_envs * obs_dim];
 
     let start = Instant::now();
@@ -150,38 +156,9 @@ where
 
     for frame in 0..frames {
         let _tick = tracing::info_span!("tick").entered();
-        let _wall = start.elapsed().as_secs_f32();
         for _ in 0..config.base_substeps_per_frame {
             let _sub = tracing::info_span!("substep").entered();
-            for (i, g) in games.iter().enumerate() {
-                let o = g.observation();
-                obs_buf[i * obs_dim..(i + 1) * obs_dim].copy_from_slice(&o);
-            }
-            let actions = {
-                let _s = tracing::info_span!("select_actions").entered();
-                agent.select_actions(&obs_buf)
-            };
-            {
-                let _physics = tracing::info_span!("physics").entered();
-                for (i, g) in games.iter_mut().enumerate() {
-                    let outcome = g.step(actions[i]);
-                    let next = g.observation();
-                    if let Some(prev) = last_obs[i].replace(next.clone()) {
-                        agent.record(Transition {
-                            obs: prev,
-                            action: last_action[i],
-                            reward: outcome.reward,
-                            next_obs: next,
-                            done: outcome.done,
-                        });
-                    }
-                    last_action[i] = actions[i];
-                    if outcome.done {
-                        g.reset();
-                        last_obs[i] = None;
-                    }
-                }
-            }
+            run_substep(&mut agent, &mut games, &mut obs_buf, obs_dim, |_, _, _| {});
         }
         let _train = tracing::info_span!("train").entered();
         for _ in 0..config.train_steps_per_frame {
@@ -315,8 +292,6 @@ impl<G: Game + 'static> winit::application::ApplicationHandler for App<G> {
             agent,
             build_game: Some(build_game),
             config,
-            last_obs: Vec::new(),
-            last_action: Vec::new(),
             loss_hist: RollingStats::new(400),
             reward_hist: RollingStats::new(400),
             episode_return: Vec::new(),
@@ -428,9 +403,6 @@ struct Running<G: Game> {
     agent: Agent,
     build_game: Option<Builder<G>>,
     config: AppConfig,
-
-    last_obs: Vec<Option<Vec<f32>>>,
-    last_action: Vec<u32>,
 
     loss_hist: RollingStats,
     reward_hist: RollingStats,
@@ -547,8 +519,6 @@ impl<G: Game> Running<G> {
                 g.reset();
             }
         }
-        self.last_obs.clear();
-        self.last_action.clear();
     }
 
     /// Index of the env to paint on top in overlay mode. We use the
@@ -587,9 +557,7 @@ impl<G: Game> Running<G> {
         let num_envs = self.games.len();
         let mut obs_buf = vec![0.0_f32; num_envs * obs_dim];
 
-        if self.last_obs.len() != num_envs {
-            self.last_obs = vec![None; num_envs];
-            self.last_action = vec![0; num_envs];
+        if self.episode_return.len() != num_envs {
             self.episode_return = vec![0.0; num_envs];
             self.episode_len = vec![0; num_envs];
         }
@@ -602,49 +570,39 @@ impl<G: Game> Running<G> {
         let chunk = self.epoch_remaining.min(10);
         for _ in 0..chunk {
             for _ in 0..substeps {
-                for (i, g) in self.games.iter().enumerate() {
-                    let o = g.observation();
-                    obs_buf[i * obs_dim..(i + 1) * obs_dim].copy_from_slice(&o);
-                }
-                let actions = self.agent.select_actions(&obs_buf);
-                for (i, g) in self.games.iter_mut().enumerate() {
-                    let outcome = g.step(actions[i]);
-                    let next = g.observation();
-                    self.episode_return[i] += outcome.reward;
-                    self.episode_len[i] += 1;
-                    if let Some(prev) = self.last_obs[i].replace(next.clone()) {
-                        self.agent.record(Transition {
-                            obs: prev,
-                            action: self.last_action[i],
-                            reward: outcome.reward,
-                            next_obs: next,
-                            done: outcome.done,
-                        });
-                    }
-                    self.last_action[i] = actions[i];
-                    if outcome.done {
-                        if outcome.terminal_reward > 0.0 {
-                            self.scores_agent += 1;
-                        } else if outcome.terminal_reward < 0.0 {
-                            self.scores_opp += 1;
+                let agent = &mut self.agent;
+                let games = &mut self.games;
+                let episode_return = &mut self.episode_return;
+                let episode_len = &mut self.episode_len;
+                let scores_agent = &mut self.scores_agent;
+                let scores_opp = &mut self.scores_opp;
+                let win_rate_ema = &mut self.win_rate_ema;
+                let episode_return_hist = &mut self.episode_return_hist;
+                let return_ema = &mut self.return_ema;
+                run_substep(
+                    agent,
+                    games,
+                    &mut obs_buf,
+                    obs_dim,
+                    |i, _action, outcome| {
+                        episode_return[i] += outcome.reward;
+                        episode_len[i] += 1;
+                        if outcome.done {
+                            let agent_won = outcome.terminal_reward > 0.0;
+                            if agent_won {
+                                *scores_agent += 1;
+                            } else if outcome.terminal_reward < 0.0 {
+                                *scores_opp += 1;
+                            }
+                            *win_rate_ema =
+                                ema(*win_rate_ema, if agent_won { 1.0 } else { 0.0 }, 0.02);
+                            episode_return_hist.push(episode_return[i]);
+                            *return_ema = ema(*return_ema, episode_return[i], 0.02);
+                            episode_return[i] = 0.0;
+                            episode_len[i] = 0;
                         }
-                        self.win_rate_ema = ema(
-                            self.win_rate_ema,
-                            if outcome.terminal_reward > 0.0 {
-                                1.0
-                            } else {
-                                0.0
-                            },
-                            0.02,
-                        );
-                        self.episode_return_hist.push(self.episode_return[i]);
-                        self.return_ema = ema(self.return_ema, self.episode_return[i], 0.02);
-                        self.episode_return[i] = 0.0;
-                        self.episode_len[i] = 0;
-                        g.reset();
-                        self.last_obs[i] = None;
-                    }
-                }
+                    },
+                );
             }
             for _ in 0..train_steps {
                 if let Some(loss) = self.agent.train_step() {
@@ -715,9 +673,7 @@ impl<G: Game> Running<G> {
 
     fn tick(&mut self) {
         let _tick = tracing::info_span!("tick").entered();
-        if self.last_obs.len() != self.games.len() {
-            self.last_obs = vec![None; self.games.len()];
-            self.last_action = vec![0; self.games.len()];
+        if self.episode_return.len() != self.games.len() {
             self.episode_return = vec![0.0; self.games.len()];
             self.episode_len = vec![0; self.games.len()];
         }
@@ -742,55 +698,44 @@ impl<G: Game> Running<G> {
 
         for _ in 0..total_subs {
             let _sub = tracing::info_span!("substep").entered();
-            for (i, g) in self.games.iter().enumerate() {
-                let o = g.observation();
-                obs_buf[i * obs_dim..(i + 1) * obs_dim].copy_from_slice(&o);
-            }
-            let actions = {
-                let _s = tracing::info_span!("select_actions").entered();
-                self.agent.select_actions(&obs_buf)
-            };
-
-            let _physics = tracing::info_span!("physics").entered();
-            for (i, g) in self.games.iter_mut().enumerate() {
-                let outcome = g.step(actions[i]);
-                let next = g.observation();
-                self.episode_return[i] += outcome.reward;
-                self.episode_len[i] += 1;
-                if let Some(prev) = self.last_obs[i].replace(next.clone()) {
-                    self.agent.record(Transition {
-                        obs: prev,
-                        action: self.last_action[i],
-                        reward: outcome.reward,
-                        next_obs: next,
-                        done: outcome.done,
-                    });
+            // Split borrows so the closure can mutate every stat field
+            // independently of `agent` and `games`.
+            let agent = &mut self.agent;
+            let games = &mut self.games;
+            let episode_return = &mut self.episode_return;
+            let episode_len = &mut self.episode_len;
+            let action_hist = &mut self.action_hist;
+            let reward_hist = &mut self.reward_hist;
+            let scores_agent = &mut self.scores_agent;
+            let scores_opp = &mut self.scores_opp;
+            let win_rate_ema = &mut self.win_rate_ema;
+            let episode_return_hist = &mut self.episode_return_hist;
+            let episode_len_hist = &mut self.episode_len_hist;
+            let return_ema = &mut self.return_ema;
+            let hist_slots = action_hist.len();
+            run_substep(agent, games, &mut obs_buf, obs_dim, |i, action, outcome| {
+                episode_return[i] += outcome.reward;
+                episode_len[i] += 1;
+                if (action as usize) < hist_slots {
+                    action_hist[action as usize] += 1;
                 }
-                self.last_action[i] = actions[i];
-                if (actions[i] as usize) < self.action_hist.len() {
-                    self.action_hist[actions[i] as usize] += 1;
-                }
-                self.reward_hist.push(outcome.reward);
-
+                reward_hist.push(outcome.reward);
                 if outcome.done {
                     let agent_won = outcome.terminal_reward > 0.0;
                     if agent_won {
-                        self.scores_agent += 1;
+                        *scores_agent += 1;
                     } else if outcome.terminal_reward < 0.0 {
-                        self.scores_opp += 1;
+                        *scores_opp += 1;
                     }
-                    self.win_rate_ema =
-                        ema(self.win_rate_ema, if agent_won { 1.0 } else { 0.0 }, 0.02);
-                    let ret = self.episode_return[i];
-                    self.episode_return_hist.push(ret);
-                    self.return_ema = ema(self.return_ema, ret, 0.02);
-                    self.episode_len_hist.push(self.episode_len[i] as f32);
-                    self.episode_return[i] = 0.0;
-                    self.episode_len[i] = 0;
-                    g.reset();
-                    self.last_obs[i] = None;
+                    *win_rate_ema = ema(*win_rate_ema, if agent_won { 1.0 } else { 0.0 }, 0.02);
+                    let ret = episode_return[i];
+                    episode_return_hist.push(ret);
+                    *return_ema = ema(*return_ema, ret, 0.02);
+                    episode_len_hist.push(episode_len[i] as f32);
+                    episode_return[i] = 0.0;
+                    episode_len[i] = 0;
                 }
-            }
+            });
             self.physics_accum = (self.physics_accum - self.spec.physics_dt).max(0.0);
         }
 

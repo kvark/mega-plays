@@ -33,7 +33,7 @@ rand = "0.10"
 # spans that meganeura's profiler captures onto the Perfetto track.
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 
-meganeura = { git = "https://github.com/kvark/meganeura", rev = "d511c61" }
+meganeura = { git = "https://github.com/kvark/meganeura", rev = "cd4e172" }
 
 [profile.release]
 lto = "thin"

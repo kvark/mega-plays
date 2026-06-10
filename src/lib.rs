@@ -28,6 +28,7 @@
 
 pub mod agent;
 pub mod app;
+pub mod env_loop;
 pub mod game;
 pub mod lander;
 pub mod pong;

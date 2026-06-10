@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use mega_plays::{
     agent::{Agent, AgentConfig, Transition},
+    env_loop::run_substep,
     game::Game,
     pong::PongGame,
 };
@@ -27,8 +28,6 @@ fn train_headless<G: Game>(
     let num_envs = games.len();
     let obs_dim = games[0].spec().obs_dim;
     let mut obs_buf = vec![0.0_f32; num_envs * obs_dim];
-    let mut last_obs: Vec<Option<Vec<f32>>> = vec![None; num_envs];
-    let mut last_action = vec![0u32; num_envs];
     let mut episode_return = vec![0.0_f32; num_envs];
     let mut total_return = 0.0_f32;
     let mut total_episodes = 0u64;
@@ -38,43 +37,27 @@ fn train_headless<G: Game>(
 
     for _ in 0..frames {
         for _ in 0..substeps {
-            for (i, g) in games.iter().enumerate() {
-                let o = g.observation();
-                obs_buf[i * obs_dim..(i + 1) * obs_dim].copy_from_slice(&o);
-            }
-            let actions = agent.select_actions(&obs_buf);
-
-            for (i, g) in games.iter_mut().enumerate() {
-                let outcome = g.step(actions[i]);
-                let next = g.observation();
-                episode_return[i] += outcome.reward;
-
-                if let Some(prev) = last_obs[i].replace(next.clone()) {
-                    agent.record(Transition {
-                        obs: prev,
-                        action: last_action[i],
-                        reward: outcome.reward,
-                        next_obs: next,
-                        done: outcome.done,
-                    });
-                }
-                last_action[i] = actions[i];
-
-                if outcome.done {
-                    if outcome.terminal_reward > 0.0 {
-                        wins += 1;
-                    } else if outcome.terminal_reward < 0.0 {
-                        losses += 1;
-                    } else {
-                        dones_no_terminal += 1;
+            run_substep(
+                agent,
+                games,
+                &mut obs_buf,
+                obs_dim,
+                |i, _action, outcome| {
+                    episode_return[i] += outcome.reward;
+                    if outcome.done {
+                        if outcome.terminal_reward > 0.0 {
+                            wins += 1;
+                        } else if outcome.terminal_reward < 0.0 {
+                            losses += 1;
+                        } else {
+                            dones_no_terminal += 1;
+                        }
+                        total_return += episode_return[i];
+                        total_episodes += 1;
+                        episode_return[i] = 0.0;
                     }
-                    total_return += episode_return[i];
-                    total_episodes += 1;
-                    episode_return[i] = 0.0;
-                    g.reset();
-                    last_obs[i] = None;
-                }
-            }
+                },
+            );
         }
 
         for _ in 0..train_steps {
