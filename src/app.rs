@@ -35,6 +35,11 @@ pub struct AppConfig {
     pub base_substeps_per_frame: u32,
     /// Minibatch gradient steps per rendered frame.
     pub train_steps_per_frame: u32,
+    /// Per-frame time budget for the physics + training loop (ms). The
+    /// slider can ask for many substeps; we stop early if we blow this
+    /// budget so the UI stays interactive. The displayed sim-rate
+    /// reflects what we actually achieved.
+    pub frame_budget_ms: u32,
     /// Clear colour behind the game grid.
     pub clear_color: Color32,
 }
@@ -46,6 +51,7 @@ impl Default for AppConfig {
             num_envs: 9,
             base_substeps_per_frame: 4,
             train_steps_per_frame: 8,
+            frame_budget_ms: 12,
             clear_color: Color32::from_rgb(8, 10, 14),
         }
     }
@@ -309,6 +315,7 @@ impl<G: Game + 'static> winit::application::ApplicationHandler for App<G> {
             episode_len_hist: RollingStats::new(200),
             scores_agent: 0,
             scores_opp: 0,
+            last_return: Vec::new(),
             action_hist: [0; 8],
             loss_ema: 0.0,
             return_ema: 0.0,
@@ -323,6 +330,9 @@ impl<G: Game + 'static> winit::application::ApplicationHandler for App<G> {
             show_overlay: true,
             view_mode,
             speed_mul: 1,
+            achieved_subs: 0,
+            requested_subs: 0,
+            tick_ms: 0.0,
             exit_deadline,
             frame_counter: 0,
             last_heartbeat: 0.0,
@@ -421,6 +431,11 @@ struct Running<G: Game> {
     episode_len_hist: RollingStats,
     scores_agent: u64,
     scores_opp: u64,
+    /// Per-env total reward from the most recently completed episode.
+    /// Drives the overlay's hero pick — "best recent run" instead of
+    /// "longest live episode", so the camera highlights *good* play
+    /// rather than a policy that's just stalling for time.
+    last_return: Vec<f32>,
     /// Rolling count of each action taken since last heartbeat. Reset
     /// at every log print. Useful for catching policy collapse.
     action_hist: [u64; 8],
@@ -443,6 +458,15 @@ struct Running<G: Game> {
     /// Speed multiplier from the UI slider. Total substeps per frame
     /// is `base_substeps_per_frame * speed_mul`.
     speed_mul: i32,
+    /// Substeps actually advanced on the last frame, before the budget
+    /// fired. Used to display the effective sim multiplier so the user
+    /// can see when the slider is pinned by the time budget rather
+    /// than by their setting.
+    achieved_subs: u32,
+    /// Substeps the slider asked for on the last frame (= base × slider).
+    requested_subs: u32,
+    /// Wall-clock time spent inside `tick()` last frame (ms).
+    tick_ms: f32,
 
     /// Auto-curriculum: adjust game difficulty to maintain a target
     /// win/loss ratio. When enabled, the controller nudges
@@ -517,6 +541,7 @@ impl<G: Game> Running<G> {
         self.return_ema = 0.0;
         self.scores_agent = 0;
         self.scores_opp = 0;
+        self.last_return = vec![0.0; new_num_envs];
         self.win_rate_ema = self.target_win_ratio / (1.0 + self.target_win_ratio);
 
         // Rebuild the game vector to match the new env count.
@@ -530,17 +555,41 @@ impl<G: Game> Running<G> {
         }
     }
 
-    /// Index of the env to paint on top in overlay mode. We use the
-    /// longest-running *current* episode as a proxy for "doing best
-    /// right now": for pong that's the longest rally, for lander it's
-    /// the agent that has survived the most substeps without
-    /// crashing. Ties break toward the lowest-index env.
+    /// Index of the env to paint on top in overlay mode. We promote the
+    /// env with the highest *most-recently-completed* return, plus the
+    /// current in-flight episode return as a tiebreaker / catch-all
+    /// when nothing has completed yet. The previous "longest live
+    /// episode" heuristic celebrated a stalling policy that never
+    /// terminated (especially the lander hoverer before truncation
+    /// landed). Ties break toward the lowest-index env.
     fn hero_env(&self) -> usize {
-        self.episode_len
-            .iter()
-            .enumerate()
-            .max_by_key(|&(_, len)| *len)
-            .map_or(0, |(i, _)| i)
+        let n = self.games.len().max(1);
+        let last_return = if self.last_return.len() == n {
+            &self.last_return[..]
+        } else {
+            &[]
+        };
+        let episode_return = if self.episode_return.len() == n {
+            &self.episode_return[..]
+        } else {
+            &[]
+        };
+        let key = |i: usize| -> f32 {
+            let lr = last_return.get(i).copied().unwrap_or(0.0);
+            let ip = episode_return.get(i).copied().unwrap_or(0.0);
+            // Last completed dominates; in-flight breaks ties.
+            lr + 0.1 * ip
+        };
+        let mut best = 0;
+        let mut best_k = key(0);
+        for i in 1..n {
+            let k = key(i);
+            if k > best_k {
+                best_k = k;
+                best = i;
+            }
+        }
+        best
     }
 
     /// Start a training epoch: 10 000 headless frames processed in
@@ -685,9 +734,11 @@ impl<G: Game> Running<G> {
 
     fn tick(&mut self) {
         let _tick = tracing::info_span!("tick").entered();
+        let tick_start = Instant::now();
         if self.episode_return.len() != self.games.len() {
             self.episode_return = vec![0.0; self.games.len()];
             self.episode_len = vec![0; self.games.len()];
+            self.last_return = vec![0.0; self.games.len()];
         }
 
         let now = Instant::now();
@@ -697,20 +748,28 @@ impl<G: Game> Running<G> {
 
         // Pause stops physics but training keeps draining replay below.
         // Substeps per frame: base × slider. We hold the same action for
-        // `action_repeat` substeps, so each frame issues `bursts` GPU
-        // inference round trips instead of `total_subs`.
+        // `action_repeat` substeps. The slider can ask for more bursts
+        // than fit a per-frame time budget; stop early and surface the
+        // achieved rate so the user can tell when they're pinned by
+        // compute rather than by their setting.
         let total_subs = if self.paused {
             0
         } else {
             (self.config.base_substeps_per_frame as i32 * self.speed_mul).max(1) as u32
         };
-        let action_repeat = self.agent.action_repeat();
-        let bursts = total_subs / action_repeat.max(1);
+        let action_repeat = self.agent.action_repeat().max(1);
+        let bursts_requested = total_subs / action_repeat;
+        let frame_budget =
+            std::time::Duration::from_millis(self.config.frame_budget_ms.max(1) as u64);
         let obs_dim = self.spec.obs_dim;
         let num_envs = self.games.len();
         let mut obs_buf = vec![0.0_f32; num_envs * obs_dim];
 
-        for _ in 0..bursts {
+        let mut bursts_done = 0u32;
+        for _ in 0..bursts_requested {
+            if tick_start.elapsed() >= frame_budget {
+                break;
+            }
             let _sub = tracing::info_span!("substep").entered();
             // Split borrows so the closure can mutate every stat field
             // independently of `agent` and `games`.
@@ -718,6 +777,7 @@ impl<G: Game> Running<G> {
             let games = &mut self.games;
             let episode_return = &mut self.episode_return;
             let episode_len = &mut self.episode_len;
+            let last_return = &mut self.last_return;
             let action_hist = &mut self.action_hist;
             let reward_hist = &mut self.reward_hist;
             let scores_agent = &mut self.scores_agent;
@@ -740,26 +800,34 @@ impl<G: Game> Running<G> {
                         action_hist[action as usize] += 1;
                     }
                     reward_hist.push(outcome.reward);
-                    if outcome.done {
-                        let agent_won = outcome.terminal_reward > 0.0;
-                        if agent_won {
-                            *scores_agent += 1;
-                        } else if outcome.terminal_reward < 0.0 {
-                            *scores_opp += 1;
+                    if outcome.done || outcome.truncated {
+                        if outcome.done {
+                            let agent_won = outcome.terminal_reward > 0.0;
+                            if agent_won {
+                                *scores_agent += 1;
+                            } else if outcome.terminal_reward < 0.0 {
+                                *scores_opp += 1;
+                            }
+                            *win_rate_ema =
+                                ema(*win_rate_ema, if agent_won { 1.0 } else { 0.0 }, 0.02);
                         }
-                        *win_rate_ema = ema(*win_rate_ema, if agent_won { 1.0 } else { 0.0 }, 0.02);
                         let ret = episode_return[i];
                         episode_return_hist.push(ret);
                         *return_ema = ema(*return_ema, ret, 0.02);
                         episode_len_hist.push(episode_len[i] as f32);
+                        last_return[i] = ret;
                         episode_return[i] = 0.0;
                         episode_len[i] = 0;
                     }
                 },
             );
+            bursts_done += 1;
             self.physics_accum =
                 (self.physics_accum - self.spec.physics_dt * action_repeat as f32).max(0.0);
         }
+        let achieved_subs = bursts_done * action_repeat;
+        self.achieved_subs = achieved_subs;
+        self.requested_subs = bursts_requested * action_repeat;
 
         // Auto-curriculum: increase difficulty when the agent is
         // winning too much. One-directional ratchet — never reduces
@@ -784,11 +852,12 @@ impl<G: Game> Running<G> {
         // Training continues even when physics is paused — that's what
         // makes pause genuinely useful for "stop the action, let the
         // network finish chewing on what it just saw". Scale by the
-        // requested sim speed so the slider also accelerates learning.
+        // *achieved* sim rate (not requested) so a budget-capped frame
+        // doesn't also fire spurious training that ran on stale data.
         let train_steps = if self.paused {
             self.config.train_steps_per_frame
         } else {
-            self.config.train_steps_per_frame * total_subs / self.config.base_substeps_per_frame
+            self.config.train_steps_per_frame * achieved_subs / self.config.base_substeps_per_frame
         };
         let _train = tracing::info_span!("train").entered();
         for _ in 0..train_steps {
@@ -802,6 +871,7 @@ impl<G: Game> Running<G> {
                 break;
             }
         }
+        self.tick_ms = tick_start.elapsed().as_secs_f32() * 1000.0;
     }
 
     fn redraw(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
@@ -1057,6 +1127,33 @@ impl<G: Game> Running<G> {
                     egui::Slider::new(&mut self.speed_mul, 1..=32)
                         .text("speed")
                         .integer(),
+                );
+                // Show the achieved-vs-requested sim rate so the user
+                // can see when the slider is pinned by the frame budget
+                // rather than by their setting. "tick" is how long the
+                // physics + training loop spent inside this frame.
+                let achieved_x = if self.requested_subs > 0 {
+                    self.achieved_subs as f32 / self.config.base_substeps_per_frame as f32
+                } else {
+                    0.0
+                };
+                let pinned = self.requested_subs > 0
+                    && self.achieved_subs < self.requested_subs
+                    && !self.paused;
+                let color = if pinned {
+                    Color32::from_rgb(220, 170, 60)
+                } else {
+                    Color32::from_gray(180)
+                };
+                ui.label(
+                    egui::RichText::new(format!(
+                        "  effective    {:>5.1}×   tick {:>4.1} ms{}",
+                        achieved_x,
+                        self.tick_ms,
+                        if pinned { "  (budget)" } else { "" },
+                    ))
+                    .small()
+                    .color(color),
                 );
                 ui.horizontal(|ui| {
                     ui.label("view [V]");
