@@ -1,7 +1,20 @@
 # Audit plan — making the live-learning visualization satisfying
 
-The engine works. The product didn't *feel* like it learned. Four root causes,
-ordered by impact; this doc lists each fix and tracks what shipped.
+The engine works. The product didn't *feel* like it learned. This doc
+lists each finding from two passes (the original audit + a follow-up
+Fable-on-Fable second look) and tracks what shipped.
+
+## Still missing — known live worklist
+
+- **Lander doesn't land yet.** As of the latest commit, even with the
+  +2 partial reward, wide-pad curriculum start, world ceiling and
+  truncation in place, the fresh policy on lavapipe still dies almost
+  exclusively by crash/OOB inside the first ~3 minutes. The
+  scaffolding is right; the next push is likely *not* more harness
+  fixes but actual RL changes: deeper net (two hidden layers), longer
+  warmup, prioritised replay, or n-step returns. Captured in
+  `src/agent.rs` doc as the bigger-net hint.
+- **Training-on-worker-thread.** Still deferred. See "Deferred" below.
 
 ## Status
 
@@ -87,7 +100,54 @@ that showed up in the A/B (chunk 5 dropped 91 % → 80 %).
 - `run_headless` heartbeat now prints rolling win-rate and loss EMA every
   500 frames so a CI run actually tells you whether anything is learning.
 
-## P2 — Smaller findings  — shipped (interleaved)
+## Second-pass findings  — shipped
+
+A fresh-eyes review after the first audit landed surfaced eight more
+items, all addressed in `8f4a0d6..2543340`:
+
+- **Lander's +2 partial-landing reward** was accidentally zeroed by the
+  earlier "honest pad-rate" commit and the docstring stopped matching
+  the code. Restored as the reward component (sentinel still 0 so the
+  scoreboard is honest), plus added a `win/loss/partial/timeout`
+  breakdown to the headless heartbeat that immediately revealed
+  lander dies 100 % by crash/OOB, not by timeout-after-hovering.
+- **Pad-width curriculum** for lander. Difficulty 1.0 is the design
+  half-width; lander boots at 0.5 (twice the design) and the
+  auto-curriculum tightens it as pad-rate climbs. The hard ceiling /
+  floor live in `Game::set_difficulty` clamps now, not in the
+  controller.
+- **Adam state in save/load.** `read_adam_m/v`, `write_adam_m/v`,
+  `set_adam_step_count` wired in. Format v2 carries the moments and
+  step count under a "MEGA" magic + version field.
+- **Profiling default flipped off.** README said "off by default", code
+  defaulted to *on* with an unbounded `Vec<TraceEvent>` upstream
+  (hundreds of MB/h in a long windowed session). `MEGA_TRACE` now
+  has to be set explicitly to enable.
+- **Truncation handling in remaining loops.** `tick` was the only
+  loop that flushed episode stats on `done || truncated`;
+  `train_epoch_chunk` and `tests/headless` only checked `done`.
+  Episode returns no longer accumulate across truncation resets.
+- **Wall-clock-anchored sim speed.** `tick()` used to compute
+  substeps as `base × speed_mul`, independent of dt — "1×" was
+  ~2× real-time at 60 fps and ⅓× at 10 fps. Now `target_subs =
+  (dt × speed_mul) / physics_dt`, so 1× means real-time. The frame
+  budget caps both the substep *and* the training loops; a slow GPU
+  no longer overruns by 100+ ms.
+- **Human play.** `P` toggles human control of env 0's opponent
+  paddle via ↑/↓ — the "you vs the live-learning agent" demo the
+  README always promised. `Game::set_human_input` is the channel;
+  defaults to no-op, pong implements it, lander ignores it.
+- **Showcase line + Q-bars.** Training panel shows `param-count →
+  device-name @ grad-rate`; hero env in overlay mode gets a row of
+  Q-value bars with the argmax in green, so the user sees not just
+  *that* the policy improves but *what* it thinks each substep.
+- **Misc:** `AgentConfig::hidden` docstring corrected (one hidden
+  layer, not two); `MEGAPLAYS_SEED=<u64>` seeds the Agent RNG for
+  reproducible A/Bs; meganeura plan cache wired at
+  `target/meganeura-cache/`; CI release-builds both binaries; egglog
+  graph-naming WARN spam silenced by default `RUST_LOG`.
+
+## P2 — Smaller findings (first audit) — shipped (interleaved)
 
 - meganeura `Session::drop` leaked `grad_clip_acc` → fixed on
   `claude/game-learning-agents-nSKEt` of meganeura; SHA bumped here. The bump
