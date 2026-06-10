@@ -30,7 +30,35 @@
 use std::{collections::VecDeque, sync::Arc};
 
 use meganeura::{Graph, Session, nn};
-use rand::{RngExt, seq::IteratorRandom};
+use rand::{RngExt, SeedableRng, seq::IteratorRandom};
+
+/// Where to stash the meganeura plan cache. Best-effort: any failure
+/// (creating the directory, missing `CARGO_TARGET_DIR`, etc.) returns
+/// `None` and the build will recompile from scratch.
+fn cache_dir() -> Option<std::path::PathBuf> {
+    let target = std::env::var_os("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("target"));
+    let dir = target.join("meganeura-cache");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
+/// Build the agent's RNG: seeded from `MEGAPLAYS_SEED=<u64>` when set
+/// (for reproducible A/B comparisons of hyperparameter changes), else
+/// from OS entropy.
+fn agent_rng() -> rand::rngs::StdRng {
+    if let Some(seed) = std::env::var("MEGAPLAYS_SEED")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        log::info!("agent RNG seeded with MEGAPLAYS_SEED={seed}");
+        return rand::rngs::StdRng::seed_from_u64(seed);
+    }
+    // rand 0.10 dropped `from_os_rng`; seed StdRng from a transient
+    // ThreadRng (OS-seeded under the hood).
+    rand::rngs::StdRng::from_rng(&mut rand::rng())
+}
 
 /// Magic bytes at the head of a `.weights` file — `"MEGA"` in ASCII,
 /// little-endian. Lets `load_weights` distinguish a real file from
@@ -61,7 +89,10 @@ pub struct Transition {
 /// Pong — not a general-purpose RL configuration.
 #[derive(Clone, Debug)]
 pub struct AgentConfig {
-    /// Width of each hidden layer: `obs → hidden → hidden → actions`.
+    /// Width of the single hidden layer in the policy network. The
+    /// graph is `obs → fc1 (relu) → fc2 → Q-values`; `hidden` is the
+    /// output dim of `fc1`. Bumping it to a second hidden layer is a
+    /// non-trivial agent.rs change.
     pub hidden: usize,
     pub replay_capacity: usize,
     pub batch_size: usize,
@@ -136,7 +167,10 @@ pub struct Agent {
     target_snapshot: Vec<Vec<f32>>,
 
     replay: VecDeque<Transition>,
-    rng: rand::rngs::ThreadRng,
+    /// Seedable RNG that drives parameter init, replay sampling, and
+    /// ε-greedy action selection. Honors `MEGAPLAYS_SEED=<u64>` for
+    /// reproducible A/B runs; falls back to OS entropy when unset.
+    rng: rand::rngs::StdRng,
 
     // (soft update replaces the hard-copy counter)
     pub gradient_steps: u64,
@@ -184,11 +218,28 @@ impl Agent {
         let loss = g_train.mse_loss(masked_q, masked_t);
         g_train.set_outputs(vec![loss]);
 
+        // meganeura's plan compilation includes equality-saturation
+        // (egglog) which dominates startup — a few hundred ms even on
+        // these tiny graphs. The cache key is the forward-graph hash;
+        // path differs per graph shape so a config bump doesn't load a
+        // stale plan. Cache disabled if creating the cache dir fails
+        // (e.g. read-only filesystem); meganeura silently falls back.
+        let cache_dir = cache_dir();
+        let inf_cache = cache_dir.as_ref().map(|d| {
+            d.join(format!(
+                "inf-{num_envs}x{obs_dim}-h{}-a{na}.bin",
+                cfg.hidden
+            ))
+        });
+        let train_cache = cache_dir
+            .as_ref()
+            .map(|d| d.join(format!("train-{batch}x{obs_dim}-h{}-a{na}.bin", cfg.hidden)));
         let inference = meganeura::build(
             &g_inf,
             meganeura::SessionConfig {
                 mode: meganeura::Mode::Inference,
                 gpu: Some(gpu.clone()),
+                cache: inf_cache.as_deref(),
                 ..meganeura::SessionConfig::default()
             },
         )
@@ -197,6 +248,7 @@ impl Agent {
             &g_train,
             meganeura::SessionConfig {
                 gpu: Some(gpu),
+                cache: train_cache.as_deref(),
                 ..meganeura::SessionConfig::default()
             },
         )
@@ -227,7 +279,7 @@ impl Agent {
             params,
             target_snapshot: Vec::new(),
             replay: VecDeque::with_capacity(cfg.replay_capacity),
-            rng: rand::rng(),
+            rng: agent_rng(),
             gradient_steps: 0,
             inferences: 0,
             last_loss: 0.0,
