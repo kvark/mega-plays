@@ -22,7 +22,7 @@ use egui::{Color32, CornerRadius, Painter, Pos2, Rect, Stroke, Vec2};
 
 use crate::{
     agent::{Action, Observation},
-    game::{Game, GameSpec, StepOutcome},
+    game::{Game, GameSpec, HumanInput, StepOutcome},
 };
 
 pub const OBS_DIM: usize = 6;
@@ -66,6 +66,12 @@ pub struct PongGame {
     shaping_weight: f32,
     /// Previous paddle–ball distance for potential-based shaping.
     prev_dist: f32,
+    /// Human-controlled override for the opponent paddle. When non-zero,
+    /// the scripted tracker is bypassed and the opponent paddle moves at
+    /// `axis_y * PADDLE_SPEED`. Reset to 0 on every human-input frame
+    /// when the toggle is off, so the scripted opponent resumes
+    /// transparently.
+    human_axis_y: f32,
     rng: rand::rngs::ThreadRng,
 }
 
@@ -82,6 +88,7 @@ impl PongGame {
             opponent_speed_frac: OPPONENT_SPEED_FRACTION,
             shaping_weight: SHAPING_WEIGHT,
             prev_dist: 0.0,
+            human_axis_y: 0.0,
             rng: rand::rng(),
         };
         g.reset_ball(true);
@@ -117,6 +124,14 @@ impl PongGame {
 
     fn update_opponent(&mut self, dt: f32) {
         use rand::RngExt;
+        let half = PLAY_HEIGHT * 0.5 - PADDLE_HEIGHT * 0.5;
+        if self.human_axis_y.abs() > f32::EPSILON {
+            // Human-controlled: paddle velocity = axis × PADDLE_SPEED,
+            // sign so positive axis_y moves up (matches ArrowUp).
+            let step = self.human_axis_y.clamp(-1.0, 1.0) * PADDLE_SPEED * dt;
+            self.opponent_y = (self.opponent_y + step).clamp(-half, half);
+            return;
+        }
         let noise = if self.opponent_noise > 0.0 {
             self.rng
                 .random_range(-self.opponent_noise..self.opponent_noise)
@@ -127,7 +142,6 @@ impl PongGame {
         let diff = target - self.opponent_y;
         let max_step = PADDLE_SPEED * self.opponent_speed_frac * dt;
         let step = diff.clamp(-max_step, max_step);
-        let half = PLAY_HEIGHT * 0.5 - PADDLE_HEIGHT * 0.5;
         self.opponent_y = (self.opponent_y + step).clamp(-half, half);
     }
 
@@ -335,6 +349,10 @@ impl Game for PongGame {
         self.opponent_noise = source.opponent_noise;
         self.opponent_speed_frac = source.opponent_speed_frac;
         self.shaping_weight = source.shaping_weight;
+    }
+
+    fn set_human_input(&mut self, input: HumanInput) {
+        self.human_axis_y = input.axis_y;
     }
 
     fn difficulty(&self) -> f32 {
