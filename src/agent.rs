@@ -142,6 +142,9 @@ pub struct Agent {
     pub gradient_steps: u64,
     pub inferences: u64,
     pub last_loss: f32,
+    /// Latest Q-values from `select_actions`, row-major
+    /// `[num_envs, num_actions]`. Zeros during ε≥1 warmup.
+    last_q: Vec<f32>,
 }
 
 impl Agent {
@@ -228,6 +231,7 @@ impl Agent {
             gradient_steps: 0,
             inferences: 0,
             last_loss: 0.0,
+            last_q: vec![0.0; num_envs * num_actions as usize],
             cfg,
             obs_dim,
             num_actions,
@@ -299,6 +303,11 @@ impl Agent {
         // round trip would be discarded. Skip it entirely.
         if eps >= 1.0 {
             self.inferences += self.num_envs as u64;
+            // Keep last_q at zeros so the Q-bar overlay reads "no
+            // signal yet" rather than stale post-bootstrap noise.
+            for v in self.last_q.iter_mut() {
+                *v = 0.0;
+            }
             return (0..self.num_envs)
                 .map(|_| self.rng.random_range(0..self.num_actions))
                 .collect();
@@ -310,15 +319,14 @@ impl Agent {
         self.inferences += self.num_envs as u64;
 
         let na = self.num_actions as usize;
-        let mut q = vec![0.0_f32; self.num_envs * na];
-        self.inference.read_output_by_index(0, &mut q);
+        self.inference.read_output_by_index(0, &mut self.last_q);
 
         let mut out = Vec::with_capacity(self.num_envs);
         for i in 0..self.num_envs {
             let a = if self.rng.random::<f32>() < eps {
                 self.rng.random_range(0..self.num_actions)
             } else {
-                argmax(&q[i * na..(i + 1) * na]) as Action
+                argmax(&self.last_q[i * na..(i + 1) * na]) as Action
             };
             out.push(a);
         }
@@ -435,6 +443,23 @@ impl Agent {
 
     pub fn replay_len(&self) -> usize {
         self.replay.len()
+    }
+
+    /// Total trainable f32 element count across all parameters
+    /// (weights and biases of fc1, fc2). Reported in the overlay so
+    /// the user can see this is a *small* live-trained net, not the
+    /// gigantic checkpoint they might assume.
+    pub fn param_count(&self) -> usize {
+        self.params.iter().map(|p| p.len()).sum()
+    }
+
+    /// Most-recent batch of Q-values from the inference session, in
+    /// row-major `[num_envs, num_actions]` layout. Refreshed every
+    /// `select_actions` call (set to zero during ε ≥ 1 warmup, since
+    /// the network isn't consulted). Used to draw Q-bars over the
+    /// hero env in the overlay.
+    pub fn last_q(&self) -> &[f32] {
+        &self.last_q
     }
 
     /// Save online weights and training state (Adam moments + step

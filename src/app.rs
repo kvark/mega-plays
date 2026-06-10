@@ -342,6 +342,8 @@ impl<G: Game + 'static> winit::application::ApplicationHandler for App<G> {
 
         let now = Instant::now();
         let initial_num_envs = config.num_envs as u32;
+        let device_label = device_label_for(&gpu);
+        let param_count = agent.param_count();
         self.state = AppState::Running(Box::new(Running {
             gpu,
             surface,
@@ -397,6 +399,11 @@ impl<G: Game + 'static> winit::application::ApplicationHandler for App<G> {
             epoch_total: 0,
             render_prims: 0,
             render_verts: 0,
+            device_label,
+            param_count,
+            grad_rate: 0.0,
+            prev_grad_steps: 0,
+            prev_grad_time: now,
             status_msg: String::new(),
             status_time: now,
         }));
@@ -588,6 +595,21 @@ struct Running<G: Game> {
     /// Per-frame render timing (updated every frame, logged at heartbeat).
     render_prims: usize,
     render_verts: usize,
+
+    /// Cached device name (e.g. "llvmpipe (LLVM 20.1.2, 256 bits)" on
+    /// lavapipe, or the real GPU name otherwise) and the count of
+    /// trainable parameters. Sampled once at startup; shown in the
+    /// overlay as a one-line proof that this *is* a live-trained net
+    /// on real GPU hardware.
+    device_label: String,
+    param_count: usize,
+    /// Sliding measurement of gradient steps per wall-clock second.
+    /// `prev_grad_steps` is the value at `prev_grad_time`; the rate is
+    /// `(grad_steps - prev_grad_steps) / (now - prev_grad_time)`.
+    /// Refreshed at each ≥1 s interval so the display is stable.
+    grad_rate: f32,
+    prev_grad_steps: u64,
+    prev_grad_time: Instant,
 
     /// Brief status message shown in the UI, fades after a few seconds.
     status_msg: String,
@@ -1030,6 +1052,22 @@ impl<G: Game> Running<G> {
             }
         }
         self.tick_ms = tick_start.elapsed().as_secs_f32() * 1000.0;
+
+        // Refresh grad-rate at ≥1 s intervals so the display reads
+        // cleanly. Anything finer-grained twitches with every train
+        // step and conveys nothing extra.
+        let since = tick_start
+            .saturating_duration_since(self.prev_grad_time)
+            .as_secs_f32();
+        if since >= 1.0 {
+            let dgrad = self
+                .agent
+                .gradient_steps
+                .saturating_sub(self.prev_grad_steps);
+            self.grad_rate = dgrad as f32 / since;
+            self.prev_grad_steps = self.agent.gradient_steps;
+            self.prev_grad_time = tick_start;
+        }
     }
 
     fn redraw(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
@@ -1245,6 +1283,17 @@ impl<G: Game> Running<G> {
                             Stroke::new(1.5, Color32::from_rgb(230, 210, 90)),
                             egui::StrokeKind::Inside,
                         );
+                        // Q-bars for the hero env: one bar per action,
+                        // height ∝ Q-value (centred at zero so negative
+                        // bars hang below). The argmax bar is bright
+                        // green — that's the action ε-greedy would pick.
+                        draw_q_bars(
+                            painter,
+                            play,
+                            self.agent.last_q(),
+                            hero,
+                            self.spec.num_actions as usize,
+                        );
                     }
                 }
             });
@@ -1272,6 +1321,19 @@ impl<G: Game> Running<G> {
                         self.reset_learning();
                     }
                 });
+
+                // Showcase line — proves at a glance what this is:
+                // a tiny MLP being trained live on the user's GPU.
+                ui.label(
+                    egui::RichText::new(format!(
+                        "training {} params  →  {} @ {:.0} grad/s",
+                        format_count(self.param_count),
+                        self.device_label,
+                        self.grad_rate,
+                    ))
+                    .small()
+                    .color(Color32::from_rgb(140, 200, 230)),
+                );
 
                 ui.label(format!("wall time       {:7.1} s", wall));
                 ui.label(format!(
@@ -1586,6 +1648,86 @@ impl<G: Game> Running<G> {
         self.gui_painter.destroy(&self.gpu);
         self.gpu.destroy_surface(&mut self.surface);
     }
+}
+
+/// Q-bars for the hero env: one short vertical bar per action along
+/// the bottom edge of `play`, height proportional to the Q-value with
+/// the argmax in bright green. The whole strip occupies ~10% of the
+/// play rect height. Zeros (warmup, no inference yet) render as a
+/// dimmed baseline.
+fn draw_q_bars(painter: &egui::Painter, play: Rect, last_q: &[f32], hero: usize, na: usize) {
+    if na == 0 || last_q.len() < (hero + 1) * na {
+        return;
+    }
+    let q = &last_q[hero * na..(hero + 1) * na];
+    let span = q.iter().fold(0.0_f32, |a, &v| a.max(v.abs())).max(1e-3);
+    let strip_h = play.height() * 0.10;
+    let strip_y = play.max.y - strip_h - 2.0;
+    let bar_w = (play.width() * 0.7) / na as f32;
+    let strip_w = bar_w * na as f32;
+    let strip_x0 = play.center().x - strip_w * 0.5;
+    let mid_y = strip_y + strip_h * 0.5;
+    painter.line_segment(
+        [
+            Pos2::new(strip_x0, mid_y),
+            Pos2::new(strip_x0 + strip_w, mid_y),
+        ],
+        Stroke::new(0.5, Color32::from_gray(80)),
+    );
+    let mut argmax = 0;
+    for i in 1..na {
+        if q[i] > q[argmax] {
+            argmax = i;
+        }
+    }
+    for (i, &v) in q.iter().enumerate() {
+        let h = (v / span).clamp(-1.0, 1.0) * (strip_h * 0.5);
+        let x0 = strip_x0 + i as f32 * bar_w + 1.0;
+        let x1 = x0 + bar_w - 2.0;
+        let (y0, y1) = if h >= 0.0 {
+            (mid_y - h, mid_y)
+        } else {
+            (mid_y, mid_y - h)
+        };
+        let color = if i == argmax {
+            Color32::from_rgb(120, 220, 120)
+        } else {
+            Color32::from_rgb(100, 130, 170)
+        };
+        painter.rect_filled(
+            Rect::from_min_max(Pos2::new(x0, y0), Pos2::new(x1, y1)),
+            0.0,
+            color,
+        );
+    }
+}
+
+/// Compact integer for the overlay: 1_234 → "1.2 k", 4_500_000 → "4.5 M".
+/// Below 1000 it's just the count. Slightly different from
+/// `humantime`-style for the trainable-params context (where "4.5 M"
+/// is unambiguous and reads cleanly at a glance).
+fn format_count(n: usize) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1} M", n as f32 / 1.0e6)
+    } else if n >= 1_000 {
+        format!("{:.1} k", n as f32 / 1.0e3)
+    } else {
+        format!("{n}")
+    }
+}
+
+/// Build the device label shown in the overlay, e.g.
+/// `"llvmpipe (LLVM 20.1.2, 256 bits)  [software]"` or
+/// `"NVIDIA GeForce RTX 4090"`. Surfaces the software-emulation flag
+/// because performance numbers on lavapipe are a stress floor, not a
+/// reflection of the real hardware path.
+fn device_label_for(gpu: &gpu::Context) -> String {
+    let info = gpu.device_information();
+    let mut s = info.device_name.clone();
+    if info.is_software_emulated {
+        s.push_str("  [software]");
+    }
+    s
 }
 
 fn grid_dims(n: usize) -> (usize, usize) {
