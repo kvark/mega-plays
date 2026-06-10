@@ -162,10 +162,14 @@ where
 
     let action_repeat = agent.action_repeat();
     let bursts_per_frame = (config.base_substeps_per_frame / action_repeat).max(1);
-    let mut wins = 0u64;
-    let mut losses = 0u64;
-    let mut last_print_wins = 0u64;
-    let mut last_print_losses = 0u64;
+    // Four-way outcome counters: a 0% win-rate by itself can't tell
+    // "crashes constantly" from "hovers until truncation". The
+    // breakdown distinguishes them.
+    let mut wins = 0u64; // terminal_reward > 0
+    let mut losses = 0u64; // terminal_reward < 0
+    let mut partials = 0u64; // done && terminal_reward == 0 (soft off-pad etc)
+    let mut timeouts = 0u64; // truncated (time-limit / OOB-without-terminal)
+    let mut last = [0u64; 4];
     let mut loss_ema = 0.0f32;
     for frame in 0..frames {
         let _tick = tracing::info_span!("tick").entered();
@@ -183,7 +187,11 @@ where
                             wins += 1;
                         } else if outcome.terminal_reward < 0.0 {
                             losses += 1;
+                        } else {
+                            partials += 1;
                         }
+                    } else if outcome.truncated {
+                        timeouts += 1;
                     }
                 },
             );
@@ -202,17 +210,20 @@ where
             }
         }
         if frame.is_multiple_of(500) {
-            let interval_wins = wins - last_print_wins;
-            let interval_losses = losses - last_print_losses;
-            let interval_total = interval_wins + interval_losses;
-            let interval_wr = if interval_total > 0 {
-                100.0 * interval_wins as f32 / interval_total as f32
+            let dwin = wins - last[0];
+            let dloss = losses - last[1];
+            let dpart = partials - last[2];
+            let dtime = timeouts - last[3];
+            let dtotal = dwin + dloss + dpart + dtime;
+            let interval_wr = if dtotal > 0 {
+                100.0 * dwin as f32 / dtotal as f32
             } else {
                 0.0
             };
             log::info!(
                 "headless frame {} / {}  {:.1}s  replay={} grad={} eps={:.3} \
-                 wr_last_window={:.1}% loss_ema={:.4}",
+                 wr_last_window={:.1}%  win/loss/partial/timeout={}/{}/{}/{}  \
+                 loss_ema={:.4}",
                 frame,
                 frames,
                 start.elapsed().as_secs_f32(),
@@ -220,10 +231,13 @@ where
                 agent.gradient_steps,
                 agent.current_epsilon(),
                 interval_wr,
+                dwin,
+                dloss,
+                dpart,
+                dtime,
                 loss_ema,
             );
-            last_print_wins = wins;
-            last_print_losses = losses;
+            last = [wins, losses, partials, timeouts];
         }
     }
     log::info!(
