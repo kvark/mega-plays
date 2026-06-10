@@ -20,9 +20,14 @@ floor (Xvfb + lavapipe):
   by design — watch the **difficulty plot** for the real progress curve).
 - **lander** — parallel lunar landers in constant gravity, three discrete
   thrusters plus idle, a small landing pad at the centre of the ground.
-  After the truncation / ceiling / clamp fixes the agent now reliably
-  *touches* the ground softly within a few minutes; pad accuracy keeps
-  climbing past that.
+  Truncation, world ceiling, per-config TD clamp and a pad-width
+  curriculum are in place; with a wide-pad start (0.5× difficulty →
+  pad half-width 0.30, twice the design) the harness is set up to
+  *let* the agent learn. Reaching a positive pad-rate is the
+  prerequisite for the curriculum to engage, and at the time of writing
+  even with the wide pad the freshly-seeded policy still dies almost
+  exclusively by crash/OOB inside the first ~3 min on lavapipe — see
+  `AUDIT_PLAN.md` "still missing" for the live worklist.
 
 Both run as separate binaries (`cargo run --release --bin pong` /
 `--bin lander`). They share the `mega-plays` library: same driver, same
@@ -187,8 +192,8 @@ policy was a stable local optimum.
 - 6-float observation: own paddle y, opponent paddle y, ball (x, y),
   ball (vx, vy).
 - 3 discrete actions: stay, up, down. Held for 4 substeps each.
-- Reward: ±1 on scoring, 0 otherwise (plus a tiny potential-based
-  shaping for paddle-ball alignment, off by default).
+- Reward: ±1 on scoring, plus a small potential-based shaping for
+  paddle–ball alignment (default 0.1, slider-tunable to 0).
 - Opponent: scripted tracker with adjustable y-noise and speed-fraction
   sliders. Auto-curriculum nudges its tracking speed to maintain the
   target win/loss ratio (default 1.5 ≈ 60 % wins).
