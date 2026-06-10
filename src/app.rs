@@ -384,6 +384,7 @@ impl<G: Game + 'static> winit::application::ApplicationHandler for App<G> {
             speed_mul: 1,
             achieved_subs: 0,
             requested_subs: 0,
+            last_dt: 1.0 / 60.0,
             tick_ms: 0.0,
             exit_deadline,
             frame_counter: 0,
@@ -526,8 +527,11 @@ struct Running<G: Game> {
     /// can see when the slider is pinned by the time budget rather
     /// than by their setting.
     achieved_subs: u32,
-    /// Substeps the slider asked for on the last frame (= base × slider).
+    /// Substeps the slider asked for on the last frame.
     requested_subs: u32,
+    /// Wall-clock dt of the last frame, in seconds. Used to derive the
+    /// "1× = real time" sim multiplier display.
+    last_dt: f32,
     /// Wall-clock time spent inside `tick()` last frame (ms).
     tick_ms: f32,
 
@@ -813,20 +817,23 @@ impl<G: Game> Running<G> {
         let dt = (now - self.last_frame).as_secs_f32().min(0.1);
         self.last_frame = now;
         self.physics_accum += dt;
+        self.last_dt = dt;
 
-        // Pause stops physics but training keeps draining replay below.
-        // Substeps per frame: base × slider. We hold the same action for
-        // `action_repeat` substeps. The slider can ask for more bursts
-        // than fit a per-frame time budget; stop early and surface the
-        // achieved rate so the user can tell when they're pinned by
-        // compute rather than by their setting.
+        // Wall-clock-anchored sim speed. `speed_mul = 1` means "physics
+        // runs at real time" — the substep count this frame is the
+        // number of physics_dt intervals that fit into `dt × speed_mul`
+        // of wall time. The slider can ask for more bursts than fit a
+        // per-frame time budget; stop early and surface the achieved
+        // rate so the user can tell when they're pinned by compute
+        // rather than by their setting.
         let total_subs = if self.paused {
             0
         } else {
-            (self.config.base_substeps_per_frame as i32 * self.speed_mul).max(1) as u32
+            let secs = dt * self.speed_mul.max(1) as f32;
+            (secs / self.spec.physics_dt).round().max(1.0) as u32
         };
         let action_repeat = self.agent.action_repeat().max(1);
-        let bursts_requested = total_subs / action_repeat;
+        let bursts_requested = total_subs.div_ceil(action_repeat);
         let frame_budget =
             std::time::Duration::from_millis(self.config.frame_budget_ms.max(1) as u64);
         let obs_dim = self.spec.obs_dim;
@@ -949,8 +956,9 @@ impl<G: Game> Running<G> {
         // Training continues even when physics is paused — that's what
         // makes pause genuinely useful for "stop the action, let the
         // network finish chewing on what it just saw". Scale by the
-        // *achieved* sim rate (not requested) so a budget-capped frame
-        // doesn't also fire spurious training that ran on stale data.
+        // *achieved* sim rate so a budget-capped frame doesn't also
+        // fire spurious training that ran on stale data, and stop
+        // early if the frame budget is exhausted.
         let train_steps = if self.paused {
             self.config.train_steps_per_frame
         } else {
@@ -958,6 +966,9 @@ impl<G: Game> Running<G> {
         };
         let _train = tracing::info_span!("train").entered();
         for _ in 0..train_steps {
+            if tick_start.elapsed() >= frame_budget {
+                break;
+            }
             if let Some(loss) = {
                 let _s = tracing::info_span!("train_step").entered();
                 self.agent.train_step()
@@ -1229,8 +1240,10 @@ impl<G: Game> Running<G> {
                 // can see when the slider is pinned by the frame budget
                 // rather than by their setting. "tick" is how long the
                 // physics + training loop spent inside this frame.
-                let achieved_x = if self.requested_subs > 0 {
-                    self.achieved_subs as f32 / self.config.base_substeps_per_frame as f32
+                // Sim multiplier is wall-clock-anchored: 1× = physics
+                // runs at real time. Less than the slider value = pinned.
+                let achieved_x = if self.last_dt > 0.0 && self.requested_subs > 0 {
+                    self.achieved_subs as f32 * self.spec.physics_dt / self.last_dt
                 } else {
                     0.0
                 };
