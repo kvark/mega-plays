@@ -32,6 +32,13 @@ use std::{collections::VecDeque, sync::Arc};
 use meganeura::{Graph, Session, nn};
 use rand::{RngExt, seq::IteratorRandom};
 
+/// Magic bytes at the head of a `.weights` file — `"MEGA"` in ASCII,
+/// little-endian. Lets `load_weights` distinguish a real file from
+/// garbage before guessing at sizes.
+const MEGA_WEIGHTS_MAGIC: u32 = u32::from_le_bytes(*b"MEGA");
+/// Bump when the on-disk weights layout changes.
+const MEGA_WEIGHTS_VERSION: u32 = 2;
+
 /// Observation vector. Flat f32s, caller-defined layout, normalised to
 /// roughly `[-1, 1]`.
 pub type Observation = Vec<f32>;
@@ -430,32 +437,85 @@ impl Agent {
         self.replay.len()
     }
 
-    /// Save current online weights and training state to a binary file.
+    /// Save online weights and training state (Adam moments + step
+    /// count) to a binary file.
     ///
-    /// Format: `u64` gradient_steps, then for each parameter a `u32`
-    /// element count followed by that many little-endian `f32` values.
+    /// Resuming with only the weights resets Adam's first / second
+    /// moment estimates to zero, which causes a transient loss spike
+    /// and one or two thousand grad steps of recovery noise. Saving
+    /// the moments alongside means a loaded checkpoint continues
+    /// where the run left off.
+    ///
+    /// Format (`v2`, little-endian):
+    ///
+    /// ```text
+    /// u32 magic = 0x4147454D ("MEGA")
+    /// u32 version = 2
+    /// u64 gradient_steps
+    /// u32 adam_step_count
+    /// for each param:
+    ///     u32 len
+    ///     f32 * len   weights
+    ///     f32 * len   adam m (first moment estimate)
+    ///     f32 * len   adam v (second moment estimate)
+    /// ```
     pub fn save_weights(&self, path: &std::path::Path) -> std::io::Result<()> {
         use std::io::Write;
-        let snapshot = self.snapshot_training();
+        let weights = self.snapshot_training();
         let mut f = std::fs::File::create(path)?;
+        f.write_all(&MEGA_WEIGHTS_MAGIC.to_le_bytes())?;
+        f.write_all(&MEGA_WEIGHTS_VERSION.to_le_bytes())?;
         f.write_all(&self.gradient_steps.to_le_bytes())?;
-        for buf in &snapshot {
-            let len = buf.len() as u32;
+        f.write_all(&self.training.adam_step_count().to_le_bytes())?;
+        for (p, w) in self.params.iter().zip(weights.iter()) {
+            let len = w.len() as u32;
             f.write_all(&len.to_le_bytes())?;
-            f.write_all(bytemuck::cast_slice(&buf[..]))?;
+            f.write_all(bytemuck::cast_slice(&w[..]))?;
+            let mut m = vec![0.0_f32; w.len()];
+            let mut v = vec![0.0_f32; w.len()];
+            self.training.read_adam_m(&p.name, &mut m);
+            self.training.read_adam_v(&p.name, &mut v);
+            f.write_all(bytemuck::cast_slice(&m[..]))?;
+            f.write_all(bytemuck::cast_slice(&v[..]))?;
         }
         Ok(())
     }
 
-    /// Load weights from a binary file produced by [`save_weights`].
-    /// Overwrites training, inference, target-network weights, and
-    /// restores gradient_steps (so epsilon resumes correctly).
+    /// Load weights and Adam state from a binary file produced by
+    /// [`save_weights`]. Overwrites training, inference, target-network
+    /// weights and Adam moment estimates, and restores gradient_steps
+    /// (so epsilon resumes correctly) and the Adam bias-correction
+    /// step count.
     pub fn load_weights(&mut self, path: &std::path::Path) -> std::io::Result<()> {
         use std::io::Read;
         let mut f = std::fs::File::open(path)?;
+
+        let mut hdr32 = [0u8; 4];
+        f.read_exact(&mut hdr32)?;
+        let magic = u32::from_le_bytes(hdr32);
+        if magic != MEGA_WEIGHTS_MAGIC {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("not a mega-plays weights file (magic 0x{magic:08x})"),
+            ));
+        }
+        f.read_exact(&mut hdr32)?;
+        let version = u32::from_le_bytes(hdr32);
+        if version != MEGA_WEIGHTS_VERSION {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "weights file version {version}, expected {MEGA_WEIGHTS_VERSION}; \
+                     re-train"
+                ),
+            ));
+        }
+
         let mut u64_buf = [0u8; 8];
         f.read_exact(&mut u64_buf)?;
         self.gradient_steps = u64::from_le_bytes(u64_buf);
+        f.read_exact(&mut hdr32)?;
+        let adam_step = u32::from_le_bytes(hdr32);
 
         let mut len_buf = [0u8; 4];
         for p in &self.params {
@@ -472,16 +532,24 @@ impl Agent {
                     ),
                 ));
             }
-            let mut data = vec![0.0_f32; len];
-            f.read_exact(bytemuck::cast_slice_mut(&mut data[..]))?;
-            self.training.set_parameter(&p.name, &data);
-            self.inference.set_parameter(&p.name, &data);
+            let mut w = vec![0.0_f32; len];
+            let mut m = vec![0.0_f32; len];
+            let mut v = vec![0.0_f32; len];
+            f.read_exact(bytemuck::cast_slice_mut(&mut w[..]))?;
+            f.read_exact(bytemuck::cast_slice_mut(&mut m[..]))?;
+            f.read_exact(bytemuck::cast_slice_mut(&mut v[..]))?;
+            self.training.set_parameter(&p.name, &w);
+            self.inference.set_parameter(&p.name, &w);
+            self.training.write_adam_m(&p.name, &m);
+            self.training.write_adam_v(&p.name, &v);
         }
+        self.training.set_adam_step_count(adam_step);
         self.target_snapshot = self.snapshot_training();
         log::info!(
-            "loaded weights from {} (grad_steps={}, eps={:.3})",
+            "loaded weights from {} (grad_steps={}, adam_step={}, eps={:.3})",
             path.display(),
             self.gradient_steps,
+            adam_step,
             self.current_epsilon(),
         );
         Ok(())

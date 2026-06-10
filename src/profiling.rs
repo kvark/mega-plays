@@ -1,5 +1,13 @@
-//! Unconditional per-run profiling — CPU spans + GPU pass timings on
-//! a single `.pftrace` you drop into ui.perfetto.dev.
+//! Opt-in per-run profiling — CPU spans + GPU pass timings on a
+//! single `.pftrace` you drop into ui.perfetto.dev.
+//!
+//! `MEGA_TRACE` env var controls destination:
+//! - unset / `off` / `0` / empty → disabled (no subscriber, no file).
+//!   This is the default because the upstream meganeura profiler
+//!   buffer is unbounded (`Vec<TraceEvent>`); a windowed run left
+//!   open accumulates memory on the order of hundreds of MB per hour.
+//! - any other value → use as path; the trace is written at process
+//!   exit.
 //!
 //! All the hard work lives in [`meganeura::profiler`]: it maintains
 //! the global event buffer, the `tracing` subscriber, and the
@@ -7,17 +15,10 @@
 //! glue:
 //!
 //! - [`init_or_default`] sets everything up on startup and returns a
-//!   drop-guard that writes the trace at process exit.
-//! - [`record_submit`] wraps a command-encoder submit: it captures
-//!   the pre-submit timestamp, runs the caller-supplied closure
-//!   (which should call `gpu.submit(&mut encoder)`), and — using the
-//!   `Timings` blade returns on the *next* submit — feeds the GPU
-//!   track.
-//!
-//! `MEGA_TRACE` env var controls destination:
-//! - unset → `./mega-plays.pftrace` at shutdown
-//! - `off` / `0` / empty → disabled (no subscriber, no file)
-//! - any other value → use as path
+//!   drop-guard that writes the trace at process exit (no-op when
+//!   disabled).
+//! - [`record_gpu_passes`] forwards blade's per-pass timings (made
+//!   readable on the following submit) onto the GPU track.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -30,11 +31,11 @@ pub struct TraceGuard {
 }
 
 impl TraceGuard {
-    fn from_env(default_path: &str) -> Self {
+    fn from_env() -> Self {
         let target = match std::env::var("MEGA_TRACE") {
             Ok(v) if v.eq_ignore_ascii_case("off") || v == "0" || v.is_empty() => None,
             Ok(v) => Some(PathBuf::from(v)),
-            Err(_) => Some(PathBuf::from(default_path)),
+            Err(_) => None,
         };
         Self { target }
     }
@@ -72,7 +73,7 @@ impl Drop for TraceGuard {
 /// that saves the trace on drop. Call from `main()` before anything
 /// else emits spans.
 pub fn init_or_default() -> TraceGuard {
-    let guard = TraceGuard::from_env("./mega-plays.pftrace");
+    let guard = TraceGuard::from_env();
     if guard.enabled() {
         meganeura::profiler::init();
     }
