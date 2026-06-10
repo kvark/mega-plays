@@ -73,6 +73,12 @@ pub struct AgentConfig {
     /// recorded transition's reward is the sum across the burst and
     /// `next_obs` is the post-burst observation.
     pub action_repeat: u32,
+    /// Symmetric clamp on the Bellman target `r + γ·max_a' Q'(s', a')`.
+    /// Stops Q-value runaway when bootstrap mistakes feed back into the
+    /// next step's targets. Must be ≥ the largest expected |terminal
+    /// reward| or the sparse signal gets compressed and learning stalls
+    /// (lander's ±10 ate a hard ±5 clamp before this knob existed).
+    pub td_target_clamp: f32,
 }
 
 impl Default for AgentConfig {
@@ -89,6 +95,7 @@ impl Default for AgentConfig {
             target_tau: 0.005,
             warmup: 5_000,
             action_repeat: 4,
+            td_target_clamp: 5.0,
         }
     }
 }
@@ -360,7 +367,11 @@ impl Agent {
                 q.iter().copied().fold(f32::NEG_INFINITY, f32::max)
             };
             // Clamp the Bellman target to prevent Q-value divergence.
-            let td = (t.reward + self.cfg.discount * next_q_max).clamp(-5.0, 5.0);
+            // The clamp must be ≥ the largest |terminal reward| or the
+            // sparse signal gets compressed (lander's ±10 ate the old
+            // hard ±5 before this knob existed).
+            let clip = self.cfg.td_target_clamp;
+            let td = (t.reward + self.cfg.discount * next_q_max).clamp(-clip, clip);
             target[i * na + t.action as usize] = td;
         }
 

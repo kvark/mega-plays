@@ -576,8 +576,7 @@ impl<G: Game> Running<G> {
         // `action_repeat` substeps per inference + `train_steps`
         // gradient steps, so even 10 frames can take tens of ms.
         let action_repeat = self.agent.action_repeat();
-        let bursts_per_frame =
-            (self.config.base_substeps_per_frame / action_repeat.max(1)).max(1);
+        let bursts_per_frame = (self.config.base_substeps_per_frame / action_repeat.max(1)).max(1);
         let train_steps = self.config.train_steps_per_frame;
         let chunk = self.epoch_remaining.min(10);
         for _ in 0..chunk {
@@ -748,8 +747,7 @@ impl<G: Game> Running<G> {
                         } else if outcome.terminal_reward < 0.0 {
                             *scores_opp += 1;
                         }
-                        *win_rate_ema =
-                            ema(*win_rate_ema, if agent_won { 1.0 } else { 0.0 }, 0.02);
+                        *win_rate_ema = ema(*win_rate_ema, if agent_won { 1.0 } else { 0.0 }, 0.02);
                         let ret = episode_return[i];
                         episode_return_hist.push(ret);
                         *return_ema = ema(*return_ema, ret, 0.02);
@@ -759,9 +757,8 @@ impl<G: Game> Running<G> {
                     }
                 },
             );
-            self.physics_accum = (self.physics_accum
-                - self.spec.physics_dt * action_repeat as f32)
-                .max(0.0);
+            self.physics_accum =
+                (self.physics_accum - self.spec.physics_dt * action_repeat as f32).max(0.0);
         }
 
         // Auto-curriculum: increase difficulty when the agent is

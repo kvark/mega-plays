@@ -79,6 +79,18 @@ pub const SHAPE_DIST: f32 = 0.01;
 pub const SHAPE_TILT: f32 = 0.01;
 pub const SHAPE_FUEL: f32 = 0.003;
 
+/// Force a truncated reset after this many substeps. A hovering policy
+/// that never touches the ground used to live forever (since the only
+/// termination paths were ground contact and horizontal out-of-bounds),
+/// and the overlay's hero pick — longest live episode — was literally
+/// celebrating the hoverer. 15 s at 120 Hz is a generous cap relative to
+/// the few-second optimal descent.
+pub const MAX_EPISODE_STEPS: u32 = 15 * 120;
+/// World ceiling: the lander is considered out of bounds (truncated, not
+/// crashed) if it climbs higher than this. Above the spawn altitude with
+/// some slack so a tossing-up-on-spawn maneuver isn't punished.
+pub const CEILING_Y: f32 = 1.0;
+
 pub struct LanderGame {
     pos: Vec2,
     vel: Vec2,
@@ -86,6 +98,8 @@ pub struct LanderGame {
     ang_vel: f32,
     last_thrusting: bool,
     rng: rand::rngs::ThreadRng,
+    step_count: u32,
+    truncations: u32,
 
     landings: u32,
     crashes: u32,
@@ -101,6 +115,8 @@ impl LanderGame {
             ang_vel: 0.0,
             last_thrusting: false,
             rng: rand::rng(),
+            step_count: 0,
+            truncations: 0,
             landings: 0,
             crashes: 0,
             partials: 0,
@@ -116,6 +132,7 @@ impl LanderGame {
         self.angle = self.rng.random_range(-0.2..0.2);
         self.ang_vel = 0.0;
         self.last_thrusting = false;
+        self.step_count = 0;
     }
 
     fn thrust_vec(&self) -> Vec2 {
@@ -141,8 +158,8 @@ enum Landing {
 }
 
 impl LanderGame {
-    fn classify_ground_contact(&self) -> Landing {
-        if self.pos.x.abs() > PLAY_WIDTH * 0.5 {
+    fn classify_state(&self) -> Landing {
+        if self.pos.x.abs() > PLAY_WIDTH * 0.5 || self.pos.y > CEILING_Y {
             return Landing::OutOfBounds;
         }
         let touching = self.pos.y - BODY_HALF_H <= GROUND_Y;
@@ -201,8 +218,9 @@ impl Game for LanderGame {
         self.ang_vel += torque * dt;
         self.pos += self.vel * dt;
         self.angle += self.ang_vel * dt;
+        self.step_count += 1;
 
-        let landing = self.classify_ground_contact();
+        let landing = self.classify_state();
         let (terminal_r, done) = match landing {
             Landing::SoftOnPad => {
                 self.landings += 1;
@@ -210,14 +228,31 @@ impl Game for LanderGame {
             }
             Landing::SoftElsewhere => {
                 self.partials += 1;
-                (PARTIAL_LANDING_REWARD, true)
+                // Partial landings are *not* counted as wins by the
+                // harness (terminal_reward = 0). Pad-rate is the honest
+                // metric. The episode still ends — there's no recovery
+                // from sitting upright on the wrong patch of ground.
+                (0.0, true)
             }
-            Landing::Crash | Landing::OutOfBounds => {
+            Landing::Crash => {
+                self.crashes += 1;
+                (-TERMINAL_REWARD, true)
+            }
+            Landing::OutOfBounds => {
                 self.crashes += 1;
                 (-TERMINAL_REWARD, true)
             }
             Landing::None => (0.0, false),
         };
+
+        // Truncation: hard time limit forces a reset so a hovering
+        // policy can't camp forever. The bootstrap target *survives*
+        // truncation (helper records done=false), so the value
+        // estimate doesn't get falsely cut at an arbitrary substep.
+        let truncated = !done && self.step_count >= MAX_EPISODE_STEPS;
+        if truncated {
+            self.truncations += 1;
+        }
 
         // Dense shaping: distance to pad, tilt, fuel. Small compared
         // with the ±10 terminal so the sparse signal still drives
@@ -227,13 +262,13 @@ impl Game for LanderGame {
         let fuel = if thrusting { 1.0 } else { 0.0 };
         let shaping = -SHAPE_DIST * dist - SHAPE_TILT * tilt - SHAPE_FUEL * fuel;
 
-        if done {
-            self.spawn();
-        }
-
+        // The helper resets on done or truncated; we used to self-reset
+        // here, which made the post-step `observation()` already point
+        // at the freshly-spawned pose. Let the helper handle it.
         StepOutcome {
             reward: terminal_r + shaping,
             done,
+            truncated,
             terminal_reward: terminal_r,
         }
     }
@@ -336,13 +371,10 @@ impl Game for LanderGame {
 
     fn ui(&mut self, ui: &mut egui::Ui) {
         ui.label(format!(
-            "landings        {:>5}  (pad={}, off={}, crash={})",
-            self.landings + self.partials,
-            self.landings,
-            self.partials,
-            self.crashes,
+            "outcomes        pad={} off={} crash={} timeout={}",
+            self.landings, self.partials, self.crashes, self.truncations,
         ));
-        let total = self.landings + self.partials + self.crashes;
+        let total = self.landings + self.partials + self.crashes + self.truncations;
         if total > 0 {
             ui.label(format!(
                 "pad-rate        {:>5.1}%",
