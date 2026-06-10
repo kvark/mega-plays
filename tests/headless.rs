@@ -47,13 +47,15 @@ fn train_headless<G: Game>(
                 action_repeat,
                 |i, _action, outcome| {
                     episode_return[i] += outcome.reward;
-                    if outcome.done {
-                        if outcome.terminal_reward > 0.0 {
-                            wins += 1;
-                        } else if outcome.terminal_reward < 0.0 {
-                            losses += 1;
-                        } else {
-                            dones_no_terminal += 1;
+                    if outcome.done || outcome.truncated {
+                        if outcome.done {
+                            if outcome.terminal_reward > 0.0 {
+                                wins += 1;
+                            } else if outcome.terminal_reward < 0.0 {
+                                losses += 1;
+                            } else {
+                                dones_no_terminal += 1;
+                            }
                         }
                         total_return += episode_return[i];
                         total_episodes += 1;
