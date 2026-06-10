@@ -902,7 +902,9 @@ impl<G: Game> Running<G> {
         // climbing because exploration noise alone can push wr below
         // target for a few episodes. EMA-driven, not lifetime-averaged
         // (that one only updates ~1% per episode after the first 100,
-        // i.e. essentially never).
+        // i.e. essentially never). The hard ceiling/floor live in each
+        // game's `set_difficulty` clamp — `set_difficulty` itself is
+        // the only place that knows how much harder the game can get.
         let total_episodes = self.scores_agent + self.scores_opp;
         if !self.paused && self.auto_difficulty && total_episodes >= 30 {
             let target_wr = self.target_win_ratio / (1.0 + self.target_win_ratio);
@@ -911,10 +913,10 @@ impl<G: Game> Running<G> {
             let d = self.games[0].difficulty();
             let new_d = if err > DEADBAND {
                 let adj = (1.0 + err * 0.20 * dt).clamp(1.0, 1.010);
-                (d * adj).min(3.0)
+                d * adj
             } else if err < -DEADBAND {
                 let adj = (1.0 + err * 0.10 * dt).clamp(0.992, 1.0);
-                (d * adj).max(0.05)
+                d * adj
             } else {
                 d
             };
@@ -922,6 +924,8 @@ impl<G: Game> Running<G> {
                 for g in &mut self.games {
                     g.set_difficulty(new_d);
                 }
+                // Read back what the game accepted — clamps may differ
+                // per game (pong caps at 3, lander up to 5).
             }
         }
 
