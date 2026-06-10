@@ -105,6 +105,13 @@ pub struct LanderGame {
     rng: rand::rngs::ThreadRng,
     step_count: u32,
     truncations: u32,
+    /// Curriculum knob driven by the harness. `1.0` is the nominal
+    /// design difficulty (pad half-width = [`PAD_HALF_W`]); lower values
+    /// mean a wider pad (easier), higher values a narrower pad. Lander
+    /// boots at `0.5` (pad ~0.30 half-width — twice the design) so a
+    /// fresh DQN has a fat target to discover; the auto-curriculum
+    /// tightens it as pad-rate climbs.
+    difficulty: f32,
 
     landings: u32,
     crashes: u32,
@@ -122,6 +129,7 @@ impl LanderGame {
             rng: rand::rng(),
             step_count: 0,
             truncations: 0,
+            difficulty: 0.5,
             landings: 0,
             crashes: 0,
             partials: 0,
@@ -163,6 +171,13 @@ enum Landing {
 }
 
 impl LanderGame {
+    /// Curriculum-modulated pad half-width. `difficulty = 1` gives the
+    /// design [`PAD_HALF_W`]; the clamp keeps the pad from collapsing to
+    /// nothing or growing past the play area.
+    fn effective_pad_half_w(&self) -> f32 {
+        (PAD_HALF_W / self.difficulty.clamp(0.3, 5.0)).clamp(0.03, PLAY_WIDTH * 0.5 - 0.05)
+    }
+
     fn classify_state(&self) -> Landing {
         if self.pos.x.abs() > PLAY_WIDTH * 0.5 || self.pos.y > CEILING_Y {
             return Landing::OutOfBounds;
@@ -174,7 +189,7 @@ impl LanderGame {
         let upright = self.angle.cos() >= SOFT_TILT_COS;
         let slow = self.vel.x.abs() <= SOFT_VEL_X && self.vel.y.abs() <= SOFT_VEL_Y;
         if upright && slow {
-            if self.pos.x.abs() <= PAD_HALF_W {
+            if self.pos.x.abs() <= self.effective_pad_half_w() {
                 Landing::SoftOnPad
             } else {
                 Landing::SoftElsewhere
@@ -323,8 +338,9 @@ impl Game for LanderGame {
                 ],
                 Stroke::new(1.5, Color32::from_gray(110)),
             );
-            let pad_top_left = to_screen(Vec2::new(-PAD_HALF_W, GROUND_Y + 0.02));
-            let pad_bot_right = to_screen(Vec2::new(PAD_HALF_W, GROUND_Y));
+            let pad_w = self.effective_pad_half_w();
+            let pad_top_left = to_screen(Vec2::new(-pad_w, GROUND_Y + 0.02));
+            let pad_bot_right = to_screen(Vec2::new(pad_w, GROUND_Y));
             painter.rect_filled(
                 Rect::from_two_pos(pad_top_left, pad_bot_right),
                 CornerRadius::ZERO,
@@ -389,5 +405,18 @@ impl Game for LanderGame {
                 100.0 * self.landings as f32 / total as f32,
             ));
         }
+        ui.label(format!(
+            "pad half-width  {:.3}   (design {:.3})",
+            self.effective_pad_half_w(),
+            PAD_HALF_W,
+        ));
+    }
+
+    fn difficulty(&self) -> f32 {
+        self.difficulty
+    }
+
+    fn set_difficulty(&mut self, level: f32) {
+        self.difficulty = level.clamp(0.3, 5.0);
     }
 }
