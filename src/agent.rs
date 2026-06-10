@@ -374,8 +374,7 @@ impl Agent {
             let next_q_max = if t.done {
                 0.0
             } else {
-                let online_q =
-                    cpu_forward(&online, &t.next_obs, self.obs_dim, self.cfg.hidden, na);
+                let online_q = cpu_forward(&online, &t.next_obs, self.obs_dim, self.cfg.hidden, na);
                 let best_a = argmax(&online_q);
                 let target_q = cpu_forward(
                     &self.target_snapshot,
