@@ -51,6 +51,13 @@ pub const FALL_SPEED: f32 = 0.75;
 /// Largest horizontal drift the ball spawns with, at difficulty 1.
 pub const DRIFT_SPEED: f32 = 0.35;
 
+/// Ceiling the auto-curriculum runs into — each game clamps its own
+/// knob, and catch is the easiest game here: the agent still catches
+/// ~80 % at 3×, where the controller used to run out of room. At 8× the
+/// ball crosses in 0.15 s against a paddle less than half its design
+/// width.
+pub const MAX_DIFFICULTY: f32 = 8.0;
+
 pub const TERMINAL_REWARD: f32 = 1.0;
 /// Weight of the potential-based shaping on the horizontal gap. Small
 /// next to the ±1 terminal, but it is what gives the policy a gradient
@@ -115,6 +122,16 @@ impl CatchGame {
     fn gap(&self) -> f32 {
         (self.ball.x - self.paddle_x).abs() / PLAY_WIDTH
     }
+
+    /// Curriculum-modulated paddle half-width. Difficulty scales fall
+    /// speed *and* narrows the paddle, because speed alone runs out of
+    /// room: at the controller's 3× ceiling a full-width paddle still
+    /// caught 82 % of them, so the curriculum saturated and the demo
+    /// stopped having anywhere to go. `sqrt` so the paddle shrinks more
+    /// gently than the clock speeds up.
+    fn paddle_half_w(&self) -> f32 {
+        (PADDLE_HALF_W / self.difficulty.max(0.1).sqrt()).clamp(0.03, PADDLE_HALF_W * 2.0)
+    }
 }
 
 impl Default for CatchGame {
@@ -147,7 +164,7 @@ impl Game for CatchGame {
             2 => PADDLE_SPEED,
             _ => 0.0,
         };
-        let limit = PLAY_WIDTH * 0.5 - PADDLE_HALF_W;
+        let limit = PLAY_WIDTH * 0.5 - self.paddle_half_w();
         self.paddle_x = (self.paddle_x + dx * dt).clamp(-limit, limit);
 
         self.ball += self.ball_vel * dt;
@@ -168,7 +185,7 @@ impl Game for CatchGame {
         let mut terminal_r = 0.0;
         let mut done = false;
         if self.ball.y - BALL_RADIUS <= paddle_top {
-            let caught = (self.ball.x - self.paddle_x).abs() <= PADDLE_HALF_W + BALL_RADIUS;
+            let caught = (self.ball.x - self.paddle_x).abs() <= self.paddle_half_w() + BALL_RADIUS;
             if caught {
                 self.catches += 1;
                 terminal_r = TERMINAL_REWARD;
@@ -222,11 +239,11 @@ impl Game for CatchGame {
         }
 
         let paddle_tl = to_screen(Pos2::new(
-            self.paddle_x - PADDLE_HALF_W,
+            self.paddle_x - self.paddle_half_w(),
             PADDLE_Y + PADDLE_HEIGHT * 0.5,
         ));
         let paddle_br = to_screen(Pos2::new(
-            self.paddle_x + PADDLE_HALF_W,
+            self.paddle_x + self.paddle_half_w(),
             PADDLE_Y - PADDLE_HEIGHT * 0.5,
         ));
         painter.rect_filled(
@@ -276,6 +293,6 @@ impl Game for CatchGame {
     }
 
     fn set_difficulty(&mut self, level: f32) {
-        self.difficulty = level.clamp(0.3, 3.0);
+        self.difficulty = level.clamp(0.3, MAX_DIFFICULTY);
     }
 }

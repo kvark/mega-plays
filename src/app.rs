@@ -809,17 +809,19 @@ impl<G: Game> Running<G> {
                         episode_return[i] += outcome.reward;
                         episode_len[i] += 1;
                         if outcome.done || outcome.truncated {
+                            // Truncation counts as a finished, unwon
+                            // episode — see the same block in `tick`.
+                            let agent_won = outcome.done && outcome.terminal_reward > 0.0;
                             if outcome.done {
-                                let agent_won = outcome.terminal_reward > 0.0;
                                 if agent_won {
                                     *scores_agent += 1;
                                 } else if outcome.terminal_reward < 0.0 {
                                     *scores_opp += 1;
                                 }
-                                *win_rate_ema =
-                                    ema(*win_rate_ema, if agent_won { 1.0 } else { 0.0 }, 0.02);
-                                win_window.push(if agent_won { 1.0 } else { 0.0 });
                             }
+                            *win_rate_ema =
+                                ema(*win_rate_ema, if agent_won { 1.0 } else { 0.0 }, 0.02);
+                            win_window.push(if agent_won { 1.0 } else { 0.0 });
                             episode_return_hist.push(episode_return[i]);
                             *return_ema = ema(*return_ema, episode_return[i], 0.02);
                             episode_return[i] = 0.0;
@@ -991,17 +993,22 @@ impl<G: Game> Running<G> {
                     }
                     reward_hist.push(outcome.reward);
                     if outcome.done || outcome.truncated {
+                        // A truncation is not a win. Counting it as one
+                        // more finished-and-not-won episode is what lets
+                        // the curriculum notice a lander that has
+                        // settled into hovering until the time limit and
+                        // make the game easier instead of sitting on a
+                        // win rate that stopped updating.
+                        let agent_won = outcome.done && outcome.terminal_reward > 0.0;
                         if outcome.done {
-                            let agent_won = outcome.terminal_reward > 0.0;
                             if agent_won {
                                 *scores_agent += 1;
                             } else if outcome.terminal_reward < 0.0 {
                                 *scores_opp += 1;
                             }
-                            *win_rate_ema =
-                                ema(*win_rate_ema, if agent_won { 1.0 } else { 0.0 }, 0.02);
-                            win_window.push(if agent_won { 1.0 } else { 0.0 });
                         }
+                        *win_rate_ema = ema(*win_rate_ema, if agent_won { 1.0 } else { 0.0 }, 0.02);
+                        win_window.push(if agent_won { 1.0 } else { 0.0 });
                         let ret = episode_return[i];
                         episode_return_hist.push(ret);
                         *return_ema = ema(*return_ema, ret, 0.02);
@@ -1870,7 +1877,10 @@ struct Milestones {
     entries: Vec<(f32, String)>,
     first_win: bool,
     win_rate_step: usize,
-    difficulty_step: usize,
+    /// Index into [`DIFFICULTY_STEPS`]; starts past every level the
+    /// game booted at, so catch (which starts at the design difficulty)
+    /// doesn't announce "difficulty 1.0×" before it has played a frame.
+    difficulty_step: Option<usize>,
 }
 
 impl Milestones {
@@ -1898,13 +1908,18 @@ impl Milestones {
                 self.note(t, format!("win rate {:.0}%", level * 100.0));
             }
         }
-        while self.difficulty_step < DIFFICULTY_STEPS.len()
-            && difficulty >= DIFFICULTY_STEPS[self.difficulty_step]
-        {
-            let level = DIFFICULTY_STEPS[self.difficulty_step];
-            self.difficulty_step += 1;
+        let mut step = *self.difficulty_step.get_or_insert_with(|| {
+            DIFFICULTY_STEPS
+                .iter()
+                .filter(|&&d| d <= difficulty)
+                .count()
+        });
+        while step < DIFFICULTY_STEPS.len() && difficulty >= DIFFICULTY_STEPS[step] {
+            let level = DIFFICULTY_STEPS[step];
+            step += 1;
             self.note(t, format!("difficulty {level:.1}×"));
         }
+        self.difficulty_step = Some(step);
     }
 }
 

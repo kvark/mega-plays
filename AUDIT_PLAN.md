@@ -7,12 +7,12 @@ Fable-on-Fable second look) and tracks what shipped.
 ## Still missing — known live worklist
 
 - **Training-on-worker-thread.** Still deferred. See "Deferred" below.
-- **Lander's on-pad rate is the noisiest number in the repo.** Time to
-  20 % on-pad ranges from ~4 s to ~18 s across seeds where pong and
-  catch are repeatable to a second or two. It gets there, and it holds
-  ~90 % once it does, but the first success is still a lottery. A
-  proper fix is probably prioritised replay (the handful of successful
-  episodes are drowned by hundreds of crashes in a uniform sample).
+- **Prioritised replay.** Not needed for any current game, but it is
+  the obvious next lever for anything where success stays rare: a
+  handful of successful episodes are drowned by hundreds of failures in
+  a uniform sample. The lander showed this as a 3 s-to-18 s spread in
+  time-to-first-landing before its curriculum started easy enough to
+  make success routine.
 
 ## Round three — learning fast enough to watch (2026-08-04)
 
@@ -46,9 +46,19 @@ of frames.
 - **`MEGAPLAYS_SEED` now seeds the games too**, not just the agent, with
   a distinct stream per environment. A/B runs are comparable.
 - **catch** shipped as a third game: ~1 s episodes, 50 % caught at
-  2.4 s, ~100 % by 7 s. It is the fastest visible feedback in the repo
+  2.1 s, ~100 % by 7 s. It is the fastest visible feedback in the repo
   and the control case for "is the harness at fault, or is the game
-  hard?".
+  hard?". Its difficulty knob narrows the paddle as well as speeding
+  the ball, and its ceiling is 8× — at 3× the agent still caught 80 %
+  and the curriculum had nowhere left to go.
+- **`curves.rs` runs the auto-curriculum too**, so a measurement means
+  what a run of the binary means. Over 60 s at the shipped defaults:
+  catch 1.0× → 4.4×, pong 0.25× → 0.80×, lander 0.30× → 1.06× (design
+  spec at 58.5 s, still landing ~80 %).
+- **A truncated episode now counts as a finished, unwon one** in the
+  win rate and the curriculum. Otherwise a lander that settles into
+  hovering until the time limit sits on a win rate that has stopped
+  updating, and the controller never makes the game easier.
 
 ## Status
 

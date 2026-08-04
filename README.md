@@ -15,18 +15,15 @@ it and is visibly better before you have finished reading the overlay.
 
 Measured on an AMD 780M integrated GPU at the shipped defaults (25
 parallel environments, one decision burst plus 8 gradient steps per
-frame), as the wall-clock time until the win rate over the last 50
-episodes first crosses the mark — see `tests/curves.rs`:
+frame, auto-curriculum on), as the wall-clock time until the win rate
+over the last 50 episodes first crosses the mark — see
+`tests/curves.rs`:
 
-| game | milestone | reached |
-| --- | --- | --- |
-| **catch** — paddle under a falling ball | 50 % caught | **2.4 s** |
-| **pong** — against a scripted tracker | 50 % of points | **6.2 s** |
-| **lander** — soft touchdown on the pad | 20 % on-pad | **~13 s** ± |
-
-± the lander's first success is still a lottery: 3 s, 12 s, 14 s and
-15 s over four seeds, where pong and catch repeat to within a second or
-two. Once it lands once it climbs to ~90 % on-pad and stays there.
+| game | milestone | reached | difficulty after 60 s |
+| --- | --- | --- | --- |
+| **catch** — paddle under a falling ball | 50 % caught | **2.1 s** | 1.0× → **4.4×** |
+| **pong** — against a scripted tracker | 50 % of points | **5.9 s** | 0.25× → **0.80×** |
+| **lander** — soft touchdown on the pad | 20 % on-pad | **1.7 s** | 0.30× → **1.06×** |
 
 For scale, the same pong milestone took ~18 s before this round of
 tuning, and the lander never reached its milestone at all — it learned
@@ -34,10 +31,15 @@ to hover until the time limit and stayed there. What changed is
 described under [learning fast enough to
 watch](#learning-fast-enough-to-watch).
 
-All three then keep climbing — pong and catch to 90-100 %, the lander
-to ~90 % on-pad — at which point the auto-curriculum starts making the
-game harder instead, and the **difficulty plot** becomes the real
-progress curve.
+The win rates do not keep climbing, and that is the point: once the
+agent is beating the target W/L the auto-curriculum makes the game
+harder instead, so the win rate sits near 60 % by design and the
+**difficulty plot** becomes the progress curve. The lander starts on
+training wheels — a wide pad and a forgiving touchdown — and reaches
+the design specification about a minute in, still landing ~80 % of its
+episodes. Catch, the easiest game here, ends the minute catching a ball
+that falls four times faster than designed onto a paddle half the
+width.
 
 Each is a separate binary (`cargo run --release --bin pong` /
 `--bin lander` / `--bin catch`). They share the `mega-plays` library:
@@ -306,12 +308,14 @@ than the learner:
   forever and a random policy tumbled within a second. With damping,
   attitude is something a policy can hold.
 - **The curriculum scales the touchdown tolerance, not just the pad
-  width.** At the starting difficulty of 0.4 the pad is wider *and* the
+  width.** At the starting difficulty of 0.3 the pad is wider *and* the
   speed / tilt limits are looser, which takes the random-play success
-  rate from 0 % to about 2 % — enough to bootstrap from. The
+  rate from 0 % to a couple of percent — enough to bootstrap from. The
   auto-curriculum then tightens both back toward the design spec as the
-  pad-rate climbs, and that tightening is what the difficulty plot
-  shows.
+  pad-rate climbs, reaching it about a minute in, and that tightening
+  is what the difficulty plot shows. Starting at the design tolerance
+  instead is where the seed-to-seed lottery lived: first success
+  anywhere between 3 s and 18 s, or never.
 
 ## Catch specifics
 
@@ -323,10 +327,11 @@ than the learner:
 - The ball spawns at the top with a random x and sideways drift and
   bounces off the side walls; the episode is decided the moment it
   reaches paddle height, about a second later.
-- Difficulty scales fall speed and drift together. Catch saturates at
-  ~100 % within seconds, so in practice the auto-curriculum is what you
-  end up watching — the ball gets faster until the agent is winning
-  about 60 % of the time.
+- Difficulty scales fall speed and drift, and narrows the paddle
+  (`1/√difficulty`). Catch saturates at ~100 % within seconds, so in
+  practice the auto-curriculum is what you end up watching. Its ceiling
+  is 8× rather than the 3× the other games use — at 3× the agent still
+  caught 80 % and the controller had nowhere left to go.
 - This is the game to launch first if you want to *see* the point of
   the project: 25 environments resolve about 20 episodes a second, so
   the win-rate curve moves in real time.

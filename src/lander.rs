@@ -152,7 +152,7 @@ impl LanderGame {
             rng: crate::seeded_rng(),
             step_count: 0,
             truncations: 0,
-            difficulty: 0.4,
+            difficulty: 0.3,
             landings: 0,
             crashes: 0,
             partials: 0,

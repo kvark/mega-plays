@@ -65,6 +65,10 @@ impl Window {
     }
 }
 
+/// Win rate the auto-curriculum aims for — the driver's default target
+/// W/L of 1.5, i.e. the agent should win 60 % of its episodes.
+const TARGET_WIN_RATE: f32 = 0.6;
+
 #[derive(Default)]
 struct Outcomes {
     wins: u64,
@@ -114,12 +118,20 @@ fn run_curve<G: Game, F: FnMut() -> G>(
     let mut outcomes = Outcomes::default();
     let mut prev = Outcomes::default();
     let mut hit: Option<f32> = None;
+    let mut hit_design: Option<f32> = None;
     let start = Instant::now();
+    let mut last_iter = start;
     let mut next_sample = 1.0_f32;
+    // Mirror of the driver's auto-curriculum, so a run here means the
+    // same thing a run of the binary does. Seeded at the target for the
+    // same reason the driver seeds it: the controller needs something
+    // to steer by before any episode has finished.
+    let mut win_rate_ema = TARGET_WIN_RATE;
+    let start_difficulty = games[0].difficulty();
 
     println!("--- {label} ---");
     println!(
-        "    t(s)  grad/s   eps   win%(50)  win%(interval)   won  neutral  lost  trunc   loss"
+        "    t(s)  grad/s   eps   win%(50)  win%(interval)  diff   won  neutral  lost  trunc   loss"
     );
     while start.elapsed().as_secs_f32() < seconds {
         run_burst(
@@ -129,20 +141,21 @@ fn run_curve<G: Game, F: FnMut() -> G>(
             spec.obs_dim,
             repeat,
             |_, _, o| {
+                let won = o.done && o.terminal_reward > 0.0;
                 if o.done {
-                    if o.terminal_reward > 0.0 {
+                    if won {
                         outcomes.wins += 1;
-                        win_window.push(1.0);
                     } else if o.terminal_reward < 0.0 {
                         outcomes.losses += 1;
-                        win_window.push(0.0);
                     } else {
                         outcomes.neutral += 1;
-                        win_window.push(0.0);
                     }
                 } else if o.truncated {
                     outcomes.truncated += 1;
-                    win_window.push(0.0);
+                }
+                if o.done || o.truncated {
+                    win_window.push(if won { 1.0 } else { 0.0 });
+                    win_rate_ema = win_rate_ema * 0.98 + if won { 1.0 } else { 0.0 } * 0.02;
                 }
             },
         );
@@ -153,6 +166,37 @@ fn run_curve<G: Game, F: FnMut() -> G>(
         }
 
         let t = start.elapsed().as_secs_f32();
+
+        // Auto-curriculum, same rule and rates as `app::tick`: push the
+        // game harder while the agent is beating the target win rate,
+        // walk it back (more slowly) when it isn't.
+        let now = Instant::now();
+        let dt = now.duration_since(last_iter).as_secs_f32();
+        last_iter = now;
+        let episodes = outcomes.wins + outcomes.losses + outcomes.neutral + outcomes.truncated;
+        if episodes >= 30 {
+            let err = win_rate_ema - TARGET_WIN_RATE;
+            const DEADBAND: f32 = 0.04;
+            let d = games[0].difficulty();
+            let new_d = if err > DEADBAND {
+                d * (1.0 + err * 0.20 * dt).clamp(1.0, 1.010)
+            } else if err < -DEADBAND {
+                d * (1.0 + err * 0.10 * dt).clamp(0.992, 1.0)
+            } else {
+                d
+            };
+            if (new_d - d).abs() > f32::EPSILON {
+                for g in games.iter_mut() {
+                    g.set_difficulty(new_d);
+                }
+            }
+        }
+        // Only meaningful for games that *start* below the design
+        // spec — catch boots at 1.0 and only ever goes up.
+        if hit_design.is_none() && start_difficulty < 1.0 && games[0].difficulty() >= 1.0 {
+            hit_design = Some(t);
+        }
+
         if hit.is_none() && win_window.wins.len() >= 50 && win_window.rate() >= milestone {
             hit = Some(t);
         }
@@ -167,12 +211,13 @@ fn run_curve<G: Game, F: FnMut() -> G>(
                 0.0
             };
             println!(
-                "  {:6.1}  {:>6.0}  {:.2}     {:5.1}          {:5.1}      {:>5}  {:>7}  {:>4}  {:>5}  {:.4}",
+                "  {:6.1}  {:>6.0}  {:.2}     {:5.1}          {:5.1}     {:4.2}  {:>5}  {:>7}  {:>4}  {:>5}  {:.4}",
                 t,
                 agent.gradient_steps as f32 / t,
                 agent.current_epsilon(),
                 win_window.rate() * 100.0,
                 interval_wr,
+                games[0].difficulty(),
                 outcomes.wins,
                 outcomes.neutral,
                 outcomes.losses,
@@ -190,6 +235,17 @@ fn run_curve<G: Game, F: FnMut() -> G>(
     match hit {
         Some(t) => println!("  => reached {:.0}% at {t:.1}s", milestone * 100.0),
         None => println!("  => never reached {:.0}%", milestone * 100.0),
+    }
+    match hit_design {
+        Some(t) => println!(
+            "  => curriculum: started {start_difficulty:.2}×, hit the design 1.00× at \
+             {t:.1}s, ended {:.2}×",
+            games[0].difficulty()
+        ),
+        None => println!(
+            "  => curriculum: started {start_difficulty:.2}×, ended {:.2}×",
+            games[0].difficulty()
+        ),
     }
     agent.destroy();
     hit
