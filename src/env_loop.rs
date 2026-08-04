@@ -95,13 +95,20 @@ pub fn run_burst<G, F>(
 
     for (i, g) in games.iter_mut().enumerate() {
         let next_obs = g.observation();
-        agent.record(Transition {
-            obs: obs_buf[i * obs_dim..(i + 1) * obs_dim].to_vec(),
-            action: actions[i],
-            reward: burst_reward[i],
-            next_obs,
-            done: terminated[i],
-        });
+        // `should_reset` (terminal *or* truncation) is the episode
+        // boundary the agent needs: it flushes the env's pending
+        // n-step chain so a return never spans two episodes.
+        agent.record(
+            i,
+            Transition::step(
+                obs_buf[i * obs_dim..(i + 1) * obs_dim].to_vec(),
+                actions[i],
+                burst_reward[i],
+                next_obs,
+                terminated[i],
+            ),
+            should_reset[i],
+        );
         if should_reset[i] {
             g.reset();
         }

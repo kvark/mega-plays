@@ -30,7 +30,7 @@
 use std::{collections::VecDeque, sync::Arc};
 
 use meganeura::{Graph, Session, nn};
-use rand::{RngExt, SeedableRng, seq::IteratorRandom};
+use rand::{RngExt, seq::IteratorRandom};
 
 /// Where to stash the meganeura plan cache. Best-effort: any failure
 /// (creating the directory, missing `CARGO_TARGET_DIR`, etc.) returns
@@ -42,22 +42,6 @@ fn cache_dir() -> Option<std::path::PathBuf> {
     let dir = target.join("meganeura-cache");
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir)
-}
-
-/// Build the agent's RNG: seeded from `MEGAPLAYS_SEED=<u64>` when set
-/// (for reproducible A/B comparisons of hyperparameter changes), else
-/// from OS entropy.
-fn agent_rng() -> rand::rngs::StdRng {
-    if let Some(seed) = std::env::var("MEGAPLAYS_SEED")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-    {
-        log::info!("agent RNG seeded with MEGAPLAYS_SEED={seed}");
-        return rand::rngs::StdRng::seed_from_u64(seed);
-    }
-    // rand 0.10 dropped `from_os_rng`; seed StdRng from a transient
-    // ThreadRng (OS-seeded under the hood).
-    rand::rngs::StdRng::from_rng(&mut rand::rng())
 }
 
 /// Magic bytes at the head of a `.weights` file — `"MEGA"` in ASCII,
@@ -75,7 +59,12 @@ pub type Observation = Vec<f32>;
 /// game's [`GameSpec`](crate::game::GameSpec).
 pub type Action = u32;
 
-/// One step from the environment's perspective.
+/// One entry of the replay buffer: what the network is asked to fit.
+///
+/// With `n_step > 1` this is *not* one environment step — `reward` is
+/// the discounted sum over up to `n_step` consecutive steps and
+/// `next_obs` is the state at the end of that run, so `discount`
+/// carries the γ^k that belongs in front of the bootstrap term.
 #[derive(Clone, Debug)]
 pub struct Transition {
     pub obs: Observation,
@@ -83,6 +72,32 @@ pub struct Transition {
     pub reward: f32,
     pub next_obs: Observation,
     pub done: bool,
+    /// Discount in front of the bootstrap value of `next_obs`: γ^k for
+    /// the k steps folded into `reward`. A one-step transition carries
+    /// plain γ.
+    pub discount: f32,
+}
+
+impl Transition {
+    /// One raw environment step on its way into [`Agent::record`].
+    /// `discount` is filled in when the step is folded into an n-step
+    /// replay entry, so it is left at 1 here.
+    pub fn step(
+        obs: Observation,
+        action: Action,
+        reward: f32,
+        next_obs: Observation,
+        done: bool,
+    ) -> Self {
+        Self {
+            obs,
+            action,
+            reward,
+            next_obs,
+            done,
+            discount: 1.0,
+        }
+    }
 }
 
 /// DQN hyperparameters tuned for small, fast-converging tasks like
@@ -120,6 +135,15 @@ pub struct AgentConfig {
     /// reward| or the sparse signal gets compressed and learning stalls
     /// (lander's ±10 ate a hard ±5 clamp before this knob existed).
     pub td_target_clamp: f32,
+    /// How many consecutive decisions to fold into one replay entry.
+    /// `1` is plain one-step TD. Larger values hand the network real
+    /// reward from further ahead instead of making it trust its own
+    /// bootstrap for those steps, so a sparse terminal (the lander's
+    /// ±10, seconds after the decision that caused it) reaches the
+    /// policy in far fewer gradient steps. Costs bias while the policy
+    /// is still changing fast, which is exactly the trade a
+    /// minute-long demo wants.
+    pub n_step: u32,
 }
 
 impl Default for AgentConfig {
@@ -132,11 +156,20 @@ impl Default for AgentConfig {
             learning_rate: 1e-3,
             epsilon_start: 1.0,
             epsilon_end: 0.02,
-            epsilon_decay_steps: 20_000,
+            // Both schedules are set by how long a *viewer* will wait,
+            // not by what a paper would use. At the driver's ~800
+            // gradient steps a second, 5 k steps of decay is about six
+            // seconds of visible "stops flailing, starts playing", and
+            // 1 k transitions of warmup is over before the window has
+            // finished opening. Changing only this pair, at the old 9
+            // environments and one-step returns, took pong's 50 %-win
+            // milestone from ~17 s to ~11 s.
+            epsilon_decay_steps: 5_000,
             target_tau: 0.005,
-            warmup: 5_000,
+            warmup: 1_000,
             action_repeat: 4,
             td_target_clamp: 5.0,
+            n_step: 3,
         }
     }
 }
@@ -167,6 +200,10 @@ pub struct Agent {
     target_snapshot: Vec<Vec<f32>>,
 
     replay: VecDeque<Transition>,
+    /// Per-environment queue of decisions not yet folded into an
+    /// n-step return. One queue per env because envs interleave —
+    /// a return must only ever chain steps from the same episode.
+    pending: Vec<VecDeque<Transition>>,
     /// Seedable RNG that drives parameter init, replay sampling, and
     /// ε-greedy action selection. Honors `MEGAPLAYS_SEED=<u64>` for
     /// reproducible A/B runs; falls back to OS entropy when unset.
@@ -279,7 +316,8 @@ impl Agent {
             params,
             target_snapshot: Vec::new(),
             replay: VecDeque::with_capacity(cfg.replay_capacity),
-            rng: agent_rng(),
+            pending: (0..num_envs).map(|_| VecDeque::new()).collect(),
+            rng: crate::seeded_rng(),
             gradient_steps: 0,
             inferences: 0,
             last_loss: 0.0,
@@ -395,11 +433,32 @@ impl Agent {
         self.cfg.epsilon_start + (self.cfg.epsilon_end - self.cfg.epsilon_start) * t
     }
 
-    pub fn record(&mut self, t: Transition) {
-        if self.replay.len() >= self.cfg.replay_capacity {
-            self.replay.pop_front();
+    /// Record one decision from environment `env`.
+    ///
+    /// Transitions are folded into `n_step` returns before they reach
+    /// replay, so the caller has to say which env produced this one and
+    /// whether the episode ended here (terminal *or* truncation): a
+    /// multi-step return must never chain across an episode boundary,
+    /// and the tail of a finished episode has to be flushed at whatever
+    /// length it reached.
+    pub fn record(&mut self, env: usize, t: Transition, episode_ended: bool) {
+        let n = self.cfg.n_step.max(1) as usize;
+        let gamma = self.cfg.discount;
+        let queue = &mut self.pending[env];
+        queue.push_back(t);
+
+        // Mid-episode this emits exactly one entry (the queue drops back
+        // to n-1); at a boundary it drains the tail at whatever lengths
+        // remain, which is the standard way to handle the last n-1
+        // decisions of an episode.
+        while queue.len() >= n || (episode_ended && !queue.is_empty()) {
+            let folded = fold_n_step(queue, gamma);
+            queue.pop_front();
+            if self.replay.len() >= self.cfg.replay_capacity {
+                self.replay.pop_front();
+            }
+            self.replay.push_back(folded);
         }
-        self.replay.push_back(t);
     }
 
     /// Run one minibatch gradient step if enough transitions have been
@@ -457,7 +516,9 @@ impl Agent {
             // sparse signal gets compressed (lander's ±10 ate the old
             // hard ±5 before this knob existed).
             let clip = self.cfg.td_target_clamp;
-            let td = (t.reward + self.cfg.discount * next_q_max).clamp(-clip, clip);
+            // `t.discount` is γ^k for the k steps folded into `t.reward`
+            // — plain γ for one-step transitions.
+            let td = (t.reward + t.discount * next_q_max).clamp(-clip, clip);
             target[i * na + t.action as usize] = td;
         }
 
@@ -630,6 +691,37 @@ impl Agent {
             self.current_epsilon(),
         );
         Ok(())
+    }
+}
+
+/// Collapse the queued decisions of one environment into a single
+/// n-step replay entry anchored at the oldest of them.
+///
+/// `reward` becomes `r₀ + γr₁ + … + γ^(k-1)r_(k-1)`, `next_obs` the
+/// state after the last folded step, and `discount` the `γ^k` that the
+/// bootstrap value of that state has to be multiplied by. The fold
+/// stops early at a terminal step — nothing past it belongs to this
+/// episode.
+fn fold_n_step(queue: &VecDeque<Transition>, gamma: f32) -> Transition {
+    let first = &queue[0];
+    let mut reward = 0.0;
+    let mut discount = 1.0;
+    let mut last = first;
+    for t in queue.iter() {
+        reward += discount * t.reward;
+        discount *= gamma;
+        last = t;
+        if t.done {
+            break;
+        }
+    }
+    Transition {
+        obs: first.obs.clone(),
+        action: first.action,
+        reward,
+        next_obs: last.next_obs.clone(),
+        done: last.done,
+        discount,
     }
 }
 

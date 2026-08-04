@@ -95,7 +95,7 @@ impl SparkLine {
             let y = 1.0 - (v - lo) / span;
             let p = rect.min + Vec2::new(t * rect.width(), y * rect.height());
             if let Some(a) = prev {
-                painter.line_segment([a, p], Stroke::new(1.0, color));
+                painter.line_segment([a, p], Stroke::new(1.0_f32, color));
             }
             prev = Some(p);
         }

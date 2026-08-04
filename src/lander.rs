@@ -39,9 +39,11 @@
 //! stone, but pad-rate (the headline metric) only counts the on-pad
 //! case.
 //!
-//! Plus dense shaping per step: penalise distance to the pad, tilt,
-//! and fuel usage. The shaping is kept small so the sparse ±10 signal
-//! still dominates the Bellman target — same reasoning as pong.
+//! Plus dense potential-based shaping per step: the agent is paid the
+//! *change* in a potential Φ that rewards being close to the pad, slow
+//! and upright, so approaching earns and drifting away costs, while
+//! merely existing costs nothing. A full descent is worth a few points
+//! against the ±10 terminal — enough to steer, not enough to drown it.
 
 use egui::{Color32, CornerRadius, Painter, Pos2, Rect, Stroke, Vec2};
 
@@ -63,6 +65,17 @@ pub const GRAVITY: f32 = 0.8;
 pub const MAIN_THRUST: f32 = 1.6;
 /// Rotational acceleration from one RCS thruster (rad / s²).
 pub const RCS_TORQUE: f32 = 4.0;
+/// Attitude-hold damping on angular velocity (1 / s): the craft bleeds
+/// off spin with a ~0.5 s time constant, as if reaction wheels were
+/// holding it steady between thruster taps.
+///
+/// Without it a single RCS tap spins the lander forever — nothing in
+/// the world removes angular momentum — and a random policy tumbles
+/// within a second. Measured on the undamped build: 82 % of touchdowns
+/// failed *both* the tilt and the speed check, and not one of a
+/// thousand random episodes landed softly. Damping makes attitude a
+/// controllable thing rather than a coin flip at spawn.
+pub const ANG_DAMPING: f32 = 2.0;
 /// Angular velocity scale used to normalise the observation.
 pub const ANG_VEL_SCALE: f32 = 2.0;
 
@@ -78,19 +91,27 @@ pub const SOFT_TILT_COS: f32 = 0.95; // cos(angle) >= 0.95 ~ |angle| < ~18°
 pub const TERMINAL_REWARD: f32 = 10.0;
 pub const PARTIAL_LANDING_REWARD: f32 = 2.0;
 
-/// Per-step shaping weights. Kept small so the sparse terminal signal
-/// still dominates the Bellman target.
-pub const SHAPE_DIST: f32 = 0.01;
-pub const SHAPE_TILT: f32 = 0.01;
-pub const SHAPE_FUEL: f32 = 0.003;
+/// Weights of the shaping *potential* Φ — see [`LanderGame::potential`].
+/// They set how strongly the descent is pulled toward the pad, toward
+/// zero speed, and toward upright. Because only the change in Φ is paid
+/// out, a full descent is worth about `SHAPE_DIST × spawn_height` ≈ 3.7
+/// against the ±10 terminal: enough to steer, not enough to drown it.
+pub const SHAPE_DIST: f32 = 2.0;
+pub const SHAPE_SPEED: f32 = 1.0;
+pub const SHAPE_TILT: f32 = 1.0;
+/// Per-substep cost of running the main engine. A genuine cost, not
+/// shaping — kept tiny (a full 3 s burn is ~0.4) so it discourages
+/// pointless hovering without discouraging the engine itself.
+pub const SHAPE_FUEL: f32 = 0.001;
 
 /// Force a truncated reset after this many substeps. A hovering policy
 /// that never touches the ground used to live forever (since the only
 /// termination paths were ground contact and horizontal out-of-bounds),
 /// and the overlay's hero pick — longest live episode — was literally
-/// celebrating the hoverer. 15 s at 120 Hz is a generous cap relative to
-/// the few-second optimal descent.
-pub const MAX_EPISODE_STEPS: u32 = 15 * 120;
+/// celebrating the hoverer. Free fall from the spawn height takes ~2 s
+/// and a controlled descent ~4 s, so 8 s is generous; every second past
+/// that is demo time spent watching a stalled episode.
+pub const MAX_EPISODE_STEPS: u32 = 8 * 120;
 /// World ceiling: the lander is considered out of bounds (truncated, not
 /// crashed) if it climbs higher than this. Above the spawn altitude with
 /// some slack so a tossing-up-on-spawn maneuver isn't punished.
@@ -102,15 +123,17 @@ pub struct LanderGame {
     angle: f32,
     ang_vel: f32,
     last_thrusting: bool,
-    rng: rand::rngs::ThreadRng,
+    rng: rand::rngs::StdRng,
     step_count: u32,
     truncations: u32,
     /// Curriculum knob driven by the harness. `1.0` is the nominal
-    /// design difficulty (pad half-width = [`PAD_HALF_W`]); lower values
-    /// mean a wider pad (easier), higher values a narrower pad. Lander
-    /// boots at `0.5` (pad ~0.30 half-width — twice the design) so a
-    /// fresh DQN has a fat target to discover; the auto-curriculum
-    /// tightens it as pad-rate climbs.
+    /// design difficulty: pad half-width [`PAD_HALF_W`] and the
+    /// [`SOFT_VEL_X`] / [`SOFT_VEL_Y`] / [`SOFT_TILT_COS`] touchdown
+    /// limits. Lower values widen the pad *and* open the tolerance;
+    /// higher values tighten both. Lander boots at `0.4` — a fat target
+    /// and a forgiving touchdown, so a fresh DQN can actually stumble
+    /// into its first landing — and the auto-curriculum walks it back
+    /// toward 1.0 as the pad-rate climbs.
     difficulty: f32,
 
     landings: u32,
@@ -126,10 +149,10 @@ impl LanderGame {
             angle: 0.0,
             ang_vel: 0.0,
             last_thrusting: false,
-            rng: rand::rng(),
+            rng: crate::seeded_rng(),
             step_count: 0,
             truncations: 0,
-            difficulty: 0.5,
+            difficulty: 0.4,
             landings: 0,
             crashes: 0,
             partials: 0,
@@ -171,11 +194,43 @@ enum Landing {
 }
 
 impl LanderGame {
+    /// Shaping potential Φ: how good this state looks on its way to a
+    /// landing, in reward units. Near the pad, slow and upright is 0;
+    /// everything else is negative. Only differences of Φ are ever paid
+    /// out — see the shaping block in [`Game::step`].
+    fn potential(&self) -> f32 {
+        let dist = (self.pos - Vec2::new(0.0, GROUND_Y)).length();
+        let speed = self.vel.length();
+        let tilt = 1.0 - self.angle.cos().clamp(-1.0, 1.0);
+        -(SHAPE_DIST * dist + SHAPE_SPEED * speed + SHAPE_TILT * tilt)
+    }
+
     /// Curriculum-modulated pad half-width. `difficulty = 1` gives the
     /// design [`PAD_HALF_W`]; the clamp keeps the pad from collapsing to
     /// nothing or growing past the play area.
     fn effective_pad_half_w(&self) -> f32 {
         (PAD_HALF_W / self.difficulty.clamp(0.3, 5.0)).clamp(0.03, PLAY_WIDTH * 0.5 - 0.05)
+    }
+
+    /// Curriculum-modulated touchdown tolerance: `(max |vx|, max |vy|,
+    /// min cos angle)`. `difficulty = 1` is the design spec.
+    ///
+    /// Scaling this — not just the pad width — is what gets the lander
+    /// off the ground at all. A random policy touches down at a mean
+    /// |vy| of 1.37 with the craft tumbling; against the design limits
+    /// (0.4 and 18°) that is *zero* soft landings in a thousand
+    /// episodes, so the +2 / +10 rewards are unreachable by exploration
+    /// and the best policy the agent can find is to hover until the
+    /// time limit. Opening the tolerance early gives it a first
+    /// success to imitate; the auto-curriculum closes it back down as
+    /// the pad-rate climbs.
+    fn tolerance(&self) -> (f32, f32, f32) {
+        let d = self.difficulty.clamp(0.3, 5.0);
+        (
+            SOFT_VEL_X / d,
+            SOFT_VEL_Y / d,
+            1.0 - (1.0 - SOFT_TILT_COS) / d,
+        )
     }
 
     fn classify_state(&self) -> Landing {
@@ -186,8 +241,9 @@ impl LanderGame {
         if !touching {
             return Landing::None;
         }
-        let upright = self.angle.cos() >= SOFT_TILT_COS;
-        let slow = self.vel.x.abs() <= SOFT_VEL_X && self.vel.y.abs() <= SOFT_VEL_Y;
+        let (max_vx, max_vy, min_cos) = self.tolerance();
+        let upright = self.angle.cos() >= min_cos;
+        let slow = self.vel.x.abs() <= max_vx && self.vel.y.abs() <= max_vy;
         if upright && slow {
             if self.pos.x.abs() <= self.effective_pad_half_w() {
                 Landing::SoftOnPad
@@ -217,6 +273,7 @@ impl Game for LanderGame {
 
     fn step(&mut self, action: Action) -> StepOutcome {
         let dt = PHYSICS_DT;
+        let potential_before = self.potential();
 
         let thrusting = action == 1;
         let torque = match action {
@@ -236,6 +293,7 @@ impl Game for LanderGame {
         }
         self.vel += accel * dt;
         self.ang_vel += torque * dt;
+        self.ang_vel *= 1.0 - (ANG_DAMPING * dt).min(1.0);
         self.pos += self.vel * dt;
         self.angle += self.ang_vel * dt;
         self.step_count += 1;
@@ -277,13 +335,19 @@ impl Game for LanderGame {
             self.truncations += 1;
         }
 
-        // Dense shaping: distance to pad, tilt, fuel. Small compared
-        // with the ±10 terminal so the sparse signal still drives
-        // learning.
-        let dist = (self.pos - Vec2::new(0.0, GROUND_Y)).length();
-        let tilt = 1.0 - self.angle.cos().max(0.0);
+        // Potential-based shaping: pay out the *change* in Φ, never Φ
+        // itself. The previous form charged `-SHAPE_DIST × dist` every
+        // substep, which made time itself expensive: a 15 s hover ran up
+        // ~-27 against a -10 crash, so the cheapest way to stop losing
+        // points was to hit the ground hard. A difference of potentials
+        // can't reorder the optimal policy (Ng et al., 1999) — it only
+        // says which way is downhill.
+        //
+        // Φ is evaluated on the real final state at a terminal rather
+        // than forced to 0, so a crash keeps its speed penalty instead
+        // of collecting a parting bonus for arriving at the ground.
         let fuel = if thrusting { 1.0 } else { 0.0 };
-        let shaping = -SHAPE_DIST * dist - SHAPE_TILT * tilt - SHAPE_FUEL * fuel;
+        let shaping = self.potential() - potential_before - SHAPE_FUEL * fuel;
 
         // The helper resets on done or truncated; we used to self-reset
         // here, which made the post-step `observation()` already point
@@ -336,7 +400,7 @@ impl Game for LanderGame {
                     Pos2::new(rect.min.x, ground_y_screen),
                     Pos2::new(rect.max.x, ground_y_screen),
                 ],
-                Stroke::new(1.5, Color32::from_gray(110)),
+                Stroke::new(1.5_f32, Color32::from_gray(110)),
             );
             let pad_w = self.effective_pad_half_w();
             let pad_top_left = to_screen(Vec2::new(-pad_w, GROUND_Y + 0.02));
@@ -365,13 +429,13 @@ impl Game for LanderGame {
         painter.add(egui::Shape::convex_polygon(
             verts,
             tint(Color32::from_rgb(200, 210, 220)),
-            Stroke::new(1.0, tint(Color32::from_gray(40))),
+            Stroke::new(1.0_f32, tint(Color32::from_gray(40))),
         ));
         let leg_l = to_screen(self.pos + rot(Vec2::new(-BODY_HALF_W * 1.2, -BODY_HALF_H)));
         let leg_r = to_screen(self.pos + rot(Vec2::new(BODY_HALF_W * 1.2, -BODY_HALF_H)));
         let leg_anchor_l = to_screen(self.pos + rot(Vec2::new(-BODY_HALF_W, -BODY_HALF_H * 0.6)));
         let leg_anchor_r = to_screen(self.pos + rot(Vec2::new(BODY_HALF_W, -BODY_HALF_H * 0.6)));
-        let leg_stroke = Stroke::new(1.5, tint(Color32::from_gray(180)));
+        let leg_stroke = Stroke::new(1.5_f32, tint(Color32::from_gray(180)));
         painter.line_segment([leg_anchor_l, leg_l], leg_stroke);
         painter.line_segment([leg_anchor_r, leg_r], leg_stroke);
 

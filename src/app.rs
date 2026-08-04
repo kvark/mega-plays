@@ -48,7 +48,15 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             agent: AgentConfig::default(),
-            num_envs: 9,
+            // 5×5 grid. More environments is the cheapest learning
+            // speed-up available here: physics is a rounding error next
+            // to a gradient step, one batched inference covers all of
+            // them, and every extra env is more *fresh* experience per
+            // gradient step. Measured time to a 50 % pong win rate,
+            // three seeds each: 9 envs 12.5 s, 16 envs 8.6 s, 32 envs
+            // 5.7 s. 25 keeps a square grid legible at 1280×800 while
+            // sitting near the flat part of that curve.
+            num_envs: 25,
             base_substeps_per_frame: 4,
             train_steps_per_frame: 8,
             frame_budget_ms: 12,
@@ -386,6 +394,7 @@ impl<G: Game + 'static> winit::application::ApplicationHandler for App<G> {
             auto_difficulty: true,
             target_win_ratio: 1.5,
             win_rate_ema: 0.6, // = 1.5 / 2.5, matches the default target
+            win_window: RollingStats::new(50),
             start_time: now,
             last_frame: now,
             physics_accum: 0.0,
@@ -415,6 +424,7 @@ impl<G: Game + 'static> winit::application::ApplicationHandler for App<G> {
             prev_grad_time: now,
             status_msg: String::new(),
             status_time: now,
+            milestones: Milestones::default(),
         }));
     }
 
@@ -588,6 +598,14 @@ struct Running<G: Game> {
     target_win_ratio: f32,
     /// EMA of the agent's win rate (0.0–1.0), α = 0.02.
     win_rate_ema: f32,
+    /// Win / loss over the last 50 completed episodes, starting empty.
+    /// The EMA above is *seeded* at the target so the curriculum
+    /// controller has something sane to steer by before any episode has
+    /// finished, which makes it useless for reporting — it would claim a
+    /// 60 % win rate a tenth of a second after launch. This one only
+    /// ever reflects episodes that actually happened, so it is what the
+    /// milestone log and the overlay quote.
+    win_window: RollingStats,
 
     /// If set (via `MEGAPLAYS_EXIT_AFTER_SECS`), self-exit once wall
     /// time exceeds this many seconds. Used for headless smoke tests.
@@ -623,6 +641,9 @@ struct Running<G: Game> {
     /// Brief status message shown in the UI, fades after a few seconds.
     status_msg: String,
     status_time: Instant,
+
+    /// Timestamped record of what the agent has achieved so far.
+    milestones: Milestones,
 }
 
 fn make_surface_config(size: winit::dpi::PhysicalSize<u32>) -> gpu::SurfaceConfig {
@@ -672,6 +693,10 @@ impl<G: Game> Running<G> {
         self.scores_opp = 0;
         self.last_return = vec![0.0; new_num_envs];
         self.win_rate_ema = self.target_win_ratio / (1.0 + self.target_win_ratio);
+        self.win_window = RollingStats::new(50);
+        // A fresh network gets a fresh story.
+        self.milestones = Milestones::default();
+        self.start_time = Instant::now();
 
         // Rebuild the game vector to match the new env count.
         if let Some(build) = self.build_game.as_mut() {
@@ -771,6 +796,7 @@ impl<G: Game> Running<G> {
                 let scores_agent = &mut self.scores_agent;
                 let scores_opp = &mut self.scores_opp;
                 let win_rate_ema = &mut self.win_rate_ema;
+                let win_window = &mut self.win_window;
                 let episode_return_hist = &mut self.episode_return_hist;
                 let return_ema = &mut self.return_ema;
                 run_burst(
@@ -792,6 +818,7 @@ impl<G: Game> Running<G> {
                                 }
                                 *win_rate_ema =
                                     ema(*win_rate_ema, if agent_won { 1.0 } else { 0.0 }, 0.02);
+                                win_window.push(if agent_won { 1.0 } else { 0.0 });
                             }
                             episode_return_hist.push(episode_return[i]);
                             *return_ema = ema(*return_ema, episode_return[i], 0.02);
@@ -921,9 +948,15 @@ impl<G: Game> Running<G> {
         let num_envs = self.games.len();
         let mut obs_buf = vec![0.0_f32; num_envs * obs_dim];
 
+        // Physics gets at most half the frame budget; the rest is
+        // training's. Splitting it matters on slow machines, where a
+        // single burst can outlast the whole budget and — under a
+        // single shared deadline — leave nothing for the gradient steps
+        // that are the point of the demo.
+        let physics_budget = frame_budget / 2;
         let mut bursts_done = 0u32;
         for _ in 0..bursts_requested {
-            if tick_start.elapsed() >= frame_budget {
+            if tick_start.elapsed() >= physics_budget {
                 break;
             }
             let _sub = tracing::info_span!("substep").entered();
@@ -939,6 +972,7 @@ impl<G: Game> Running<G> {
             let scores_agent = &mut self.scores_agent;
             let scores_opp = &mut self.scores_opp;
             let win_rate_ema = &mut self.win_rate_ema;
+            let win_window = &mut self.win_window;
             let episode_return_hist = &mut self.episode_return_hist;
             let episode_len_hist = &mut self.episode_len_hist;
             let return_ema = &mut self.return_ema;
@@ -966,6 +1000,7 @@ impl<G: Game> Running<G> {
                             }
                             *win_rate_ema =
                                 ema(*win_rate_ema, if agent_won { 1.0 } else { 0.0 }, 0.02);
+                            win_window.push(if agent_won { 1.0 } else { 0.0 });
                         }
                         let ret = episode_return[i];
                         episode_return_hist.push(ret);
@@ -1032,6 +1067,13 @@ impl<G: Game> Running<G> {
             let cur_difficulty = self.games.first().map_or(0.0, |g| g.difficulty());
             self.difficulty_hist.push(cur_difficulty);
             self.last_sample_time = tick_start;
+            self.milestones.observe(
+                self.start_time.elapsed().as_secs_f32(),
+                self.scores_agent,
+                self.win_window.len(),
+                self.win_window.mean(),
+                cur_difficulty,
+            );
         }
 
         // Training continues even when physics is paused — that's what
@@ -1046,8 +1088,14 @@ impl<G: Game> Running<G> {
             self.config.train_steps_per_frame * achieved_subs / self.config.base_substeps_per_frame
         };
         let _train = tracing::info_span!("train").entered();
-        for _ in 0..train_steps {
-            if tick_start.elapsed() >= frame_budget {
+        for i in 0..train_steps {
+            // Always take one step, however tight the frame was. When a
+            // machine is slow enough that a single decision burst eats
+            // the whole budget — 25 landers on software Vulkan does —
+            // the "stop at the budget" rule otherwise starves training
+            // completely and the demo runs beautifully while learning
+            // nothing.
+            if i > 0 && tick_start.elapsed() >= frame_budget {
                 break;
             }
             if let Some(loss) = {
@@ -1251,9 +1299,9 @@ impl<G: Game> Running<G> {
                             let play = fit_rect(cell, play_aspect);
                             g.paint(painter, play, 255);
                             let (stroke_w, stroke_c) = if highlight_human && i == 0 {
-                                (2.0, Color32::from_rgb(230, 170, 60))
+                                (2.0_f32, Color32::from_rgb(230, 170, 60))
                             } else {
-                                (1.0, Color32::from_gray(28))
+                                (1.0_f32, Color32::from_gray(28))
                             };
                             painter.rect_stroke(
                                 cell,
@@ -1289,7 +1337,7 @@ impl<G: Game> Running<G> {
                         painter.rect_stroke(
                             play,
                             0.0,
-                            Stroke::new(1.5, Color32::from_rgb(230, 210, 90)),
+                            Stroke::new(1.5_f32, Color32::from_rgb(230, 210, 90)),
                             egui::StrokeKind::Inside,
                         );
                         // Q-bars for the hero env: one bar per action,
@@ -1315,6 +1363,10 @@ impl<G: Game> Running<G> {
             .default_pos([16.0, 16.0])
             .resizable(false)
             .collapsible(true)
+            // The panel is taller than an 800 px window once the plots
+            // and the milestone log are in it; scroll rather than push
+            // the bottom half off-screen.
+            .vscroll(true)
             .show(ctx, |ui| {
                 let wall = self.start_time.elapsed().as_secs_f32();
 
@@ -1356,6 +1408,20 @@ impl<G: Game> Running<G> {
                 ));
                 ui.label(format!("grad steps      {:>7}", self.agent.gradient_steps));
                 ui.label(format!("inferences      {:>7}", self.agent.inferences));
+
+                // What the agent has managed so far, with timestamps.
+                // The plots say "improving"; this says when each thing
+                // first happened, which is the part a viewer remembers.
+                if !self.milestones.entries.is_empty() {
+                    ui.separator();
+                    for (t, text) in self.milestones.entries.iter().rev().take(5).rev() {
+                        ui.label(
+                            egui::RichText::new(format!("{t:>6.1}s  {text}"))
+                                .monospace()
+                                .color(Color32::from_rgb(150, 200, 160)),
+                        );
+                    }
+                }
 
                 ui.separator();
                 ui.add(
@@ -1530,11 +1596,18 @@ impl<G: Game> Running<G> {
                 } else {
                     0.0
                 };
+                // Three different questions: what is it doing *now*
+                // (last 50 episodes), what is the curriculum steering by
+                // (the EMA), and what has the whole run averaged.
                 ui.label(format!(
-                    "win rate        {:>5.1}%  (EMA {:.1}%)  difficulty {:.2}",
-                    wr * 100.0,
+                    "win rate        {:>5.1}%  last 50   ({:.0}% EMA, {:.0}% all)",
+                    self.win_window.mean() * 100.0,
                     self.win_rate_ema * 100.0,
-                    self.games[0].difficulty(),
+                    wr * 100.0,
+                ));
+                ui.label(format!(
+                    "difficulty      {:>5.2}",
+                    self.games[0].difficulty()
                 ));
 
                 // Win-rate EMA + difficulty over time. When
@@ -1681,7 +1754,7 @@ fn draw_q_bars(painter: &egui::Painter, play: Rect, last_q: &[f32], hero: usize,
             Pos2::new(strip_x0, mid_y),
             Pos2::new(strip_x0 + strip_w, mid_y),
         ],
-        Stroke::new(0.5, Color32::from_gray(80)),
+        Stroke::new(0.5_f32, Color32::from_gray(80)),
     );
     let mut argmax = 0;
     for i in 1..na {
@@ -1778,6 +1851,63 @@ fn ghost_alpha_for(n_envs: usize) -> u8 {
     ((240.0 / n.sqrt()).clamp(40.0, 200.0)) as u8
 }
 
+/// Win-rate levels worth announcing, and the difficulty levels the
+/// auto-curriculum has to climb through. Crossings are one-way: the
+/// log is a record of what the agent reached, not a live gauge.
+const WIN_RATE_STEPS: [f32; 4] = [0.25, 0.5, 0.75, 0.9];
+const DIFFICULTY_STEPS: [f32; 4] = [1.0, 1.5, 2.0, 3.0];
+
+/// Timestamped log of the moments that make the learning legible —
+/// first win, win-rate crossings, difficulty steps.
+///
+/// The plots show that *something* is improving; this says what
+/// happened and when, which is the difference between "the line went
+/// up" and "it won its first point at 4 s and was winning half of them
+/// by 11 s". Echoed to `log::info!` so a headless run tells the same
+/// story.
+#[derive(Default)]
+struct Milestones {
+    entries: Vec<(f32, String)>,
+    first_win: bool,
+    win_rate_step: usize,
+    difficulty_step: usize,
+}
+
+impl Milestones {
+    fn note(&mut self, t: f32, text: String) {
+        log::info!("[{:>5.1}s] {}", t, text);
+        self.entries.push((t, text));
+    }
+
+    /// `win_rate` must be a *measured* rate over `episodes` completed
+    /// episodes — not the curriculum's seeded EMA, which reads 60 %
+    /// before the first episode has even finished.
+    fn observe(&mut self, t: f32, wins: u64, episodes: usize, win_rate: f32, difficulty: f32) {
+        if !self.first_win && wins >= 1 {
+            self.first_win = true;
+            self.note(t, "first win".into());
+        }
+        // A win rate over a handful of episodes is noise; wait for a
+        // sample worth announcing.
+        if episodes >= 20 {
+            while self.win_rate_step < WIN_RATE_STEPS.len()
+                && win_rate >= WIN_RATE_STEPS[self.win_rate_step]
+            {
+                let level = WIN_RATE_STEPS[self.win_rate_step];
+                self.win_rate_step += 1;
+                self.note(t, format!("win rate {:.0}%", level * 100.0));
+            }
+        }
+        while self.difficulty_step < DIFFICULTY_STEPS.len()
+            && difficulty >= DIFFICULTY_STEPS[self.difficulty_step]
+        {
+            let level = DIFFICULTY_STEPS[self.difficulty_step];
+            self.difficulty_step += 1;
+            self.note(t, format!("difficulty {level:.1}×"));
+        }
+    }
+}
+
 /// Exponential moving average: `current ← (1-α) * current + α * sample`.
 fn ema(current: f32, sample: f32, alpha: f32) -> f32 {
     current * (1.0 - alpha) + sample * alpha
@@ -1807,7 +1937,7 @@ fn draw_plot(
     log_y: bool,
 ) {
     painter.rect_filled(rect, 0.0, Color32::from_black_alpha(120));
-    let grid = Stroke::new(0.5, Color32::from_gray(40));
+    let grid = Stroke::new(0.5_f32, Color32::from_gray(40));
     for i in 1..4 {
         let y = rect.min.y + rect.height() * i as f32 / 4.0;
         painter.line_segment([Pos2::new(rect.min.x, y), Pos2::new(rect.max.x, y)], grid);
@@ -1827,7 +1957,7 @@ fn draw_plot(
         let y = 1.0 - (transform(v) - lo_t) / span;
         let p = rect.min + Vec2::new(t * rect.width(), y * rect.height());
         if let Some(a) = prev {
-            painter.line_segment([a, p], Stroke::new(1.2, color));
+            painter.line_segment([a, p], Stroke::new(1.2_f32, color));
         }
         prev = Some(p);
     }
@@ -1863,7 +1993,7 @@ fn draw_plot_with_marker(
     (lo, hi): (f32, f32),
 ) {
     painter.rect_filled(rect, 0.0, Color32::from_black_alpha(120));
-    let grid = Stroke::new(0.5, Color32::from_gray(40));
+    let grid = Stroke::new(0.5_f32, Color32::from_gray(40));
     for i in 1..4 {
         let y = rect.min.y + rect.height() * i as f32 / 4.0;
         painter.line_segment([Pos2::new(rect.min.x, y), Pos2::new(rect.max.x, y)], grid);
@@ -1878,7 +2008,7 @@ fn draw_plot_with_marker(
             let x2 = (x + dash_w).min(rect.max.x);
             painter.line_segment(
                 [Pos2::new(x, y), Pos2::new(x2, y)],
-                Stroke::new(1.0, Color32::from_rgb(200, 200, 90)),
+                Stroke::new(1.0_f32, Color32::from_rgb(200, 200, 90)),
             );
             x += dash_w + gap;
         }
@@ -1893,7 +2023,7 @@ fn draw_plot_with_marker(
         let y = 1.0 - (v.clamp(lo, hi) - lo) / span;
         let p = rect.min + Vec2::new(t * rect.width(), y * rect.height());
         if let Some(a) = prev {
-            painter.line_segment([a, p], Stroke::new(1.2, color));
+            painter.line_segment([a, p], Stroke::new(1.2_f32, color));
         }
         prev = Some(p);
     }

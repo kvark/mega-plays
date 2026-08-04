@@ -113,13 +113,11 @@ fn training_moves_q_values() {
 
     // Fill replay with identical transitions: obs=zeros, action=1, reward=5.0, done=true.
     for _ in 0..2000 {
-        agent.record(Transition {
-            obs: vec![0.0; 6],
-            action: 1,
-            reward: 5.0,
-            next_obs: vec![0.0; 6],
-            done: true,
-        });
+        agent.record(
+            0,
+            Transition::step(vec![0.0; 6], 1, 5.0, vec![0.0; 6], true),
+            true,
+        );
     }
 
     // Q-values before training.

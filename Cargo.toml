@@ -16,6 +16,10 @@ path = "src/bin/pong.rs"
 name = "lander"
 path = "src/bin/lander.rs"
 
+[[bin]]
+name = "catch"
+path = "src/bin/catch.rs"
+
 [dependencies]
 # Blade and Meganeura must use the same blade-graphics version. Both are
 # pinned by rev to avoid linking two copies of the GPU context type.

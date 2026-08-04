@@ -72,7 +72,7 @@ pub struct PongGame {
     /// when the toggle is off, so the scripted opponent resumes
     /// transparently.
     human_axis_y: f32,
-    rng: rand::rngs::ThreadRng,
+    rng: rand::rngs::StdRng,
 }
 
 impl PongGame {
@@ -89,7 +89,7 @@ impl PongGame {
             shaping_weight: SHAPING_WEIGHT,
             prev_dist: 0.0,
             human_axis_y: 0.0,
-            rng: rand::rng(),
+            rng: crate::seeded_rng(),
         };
         g.reset_ball(true);
         g
@@ -279,7 +279,7 @@ impl Game for PongGame {
                         Pos2::new(cx, y),
                         Pos2::new(cx, (y + dash_len).min(rect.max.y)),
                     ],
-                    Stroke::new(1.0, white),
+                    Stroke::new(1.0_f32, white),
                 );
             }
         }
