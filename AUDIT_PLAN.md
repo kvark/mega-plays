@@ -6,15 +6,49 @@ Fable-on-Fable second look) and tracks what shipped.
 
 ## Still missing — known live worklist
 
-- **Lander doesn't land yet.** As of the latest commit, even with the
-  +2 partial reward, wide-pad curriculum start, world ceiling and
-  truncation in place, the fresh policy on lavapipe still dies almost
-  exclusively by crash/OOB inside the first ~3 minutes. The
-  scaffolding is right; the next push is likely *not* more harness
-  fixes but actual RL changes: deeper net (two hidden layers), longer
-  warmup, prioritised replay, or n-step returns. Captured in
-  `src/agent.rs` doc as the bigger-net hint.
 - **Training-on-worker-thread.** Still deferred. See "Deferred" below.
+- **Lander's on-pad rate is the noisiest number in the repo.** Time to
+  20 % on-pad ranges from ~4 s to ~18 s across seeds where pong and
+  catch are repeatable to a second or two. It gets there, and it holds
+  ~90 % once it does, but the first success is still a lottery. A
+  proper fix is probably prioritised replay (the handful of successful
+  episodes are drowned by hundreds of crashes in a uniform sample).
+
+## Round three — learning fast enough to watch (2026-08-04)
+
+The prior passes fixed the harness; this one went after the wall clock
+and the lander's reward landscape. Everything below was measured with
+the new `tests/curves.rs`, which budgets **wall-clock seconds** instead
+of frames.
+
+- **n-step returns** (`AgentConfig::n_step`, default 3). Biggest single
+  win: pong's 50 %-win milestone 7.9 s → 5.0 s, lander's 20 %-on-pad
+  17.6 s → 3.8 s.
+- **Schedules re-sized in seconds**: warmup 5 000 → 1 000, ε decay
+  20 000 → 5 000 gradient steps. Five seconds of dead random play and
+  forty seconds of dithering were most of a demo.
+- **25 environments** (was 9). Three seeds each, time to pong's 50 %:
+  9 envs 12.5 s, 16 envs 8.6 s, 32 envs 5.7 s. 25 keeps the grid square
+  and legible.
+- **The lander was an unreachable-goal problem, not an RL problem.**
+  `curves.rs::random_baseline` under uniform-random play: 994
+  touchdowns, **zero** soft landings, 82 % failing tilt *and* speed at
+  once. Fixed in the world, not the learner — attitude damping so the
+  craft stops tumbling, and a curriculum that scales the touchdown
+  tolerance (not only the pad width) so random play succeeds ~2 % of
+  the time and there is something to bootstrap from. It now reaches
+  ~90 % on-pad within a minute.
+- **Potential-based shaping** in the lander (pong and catch already had
+  it). The old absolute per-step distance penalty made a 15 s hover cost
+  ~-27 against a -10 crash — crashing was the cheap way out.
+- **Milestone log** in the overlay and the driver log: first win,
+  win-rate crossings, difficulty steps, each with a timestamp.
+- **`MEGAPLAYS_SEED` now seeds the games too**, not just the agent, with
+  a distinct stream per environment. A/B runs are comparable.
+- **catch** shipped as a third game: ~1 s episodes, 50 % caught at
+  2.4 s, ~100 % by 7 s. It is the fastest visible feedback in the repo
+  and the control case for "is the harness at fault, or is the game
+  hard?".
 
 ## Status
 

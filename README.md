@@ -10,28 +10,39 @@ visibly improving inside a minute, converged in two.
 
 ## Status
 
-Two games shipping; both learn live and visibly on a CPU-Vulkan stress
-floor (Xvfb + lavapipe):
+Three games shipping. Each starts from random weights when you launch
+it and is visibly better before you have finished reading the overlay.
 
-- **pong** — 3×3 grid of parallel games against a scripted tracker.
-  Reaches ~50 % win-rate at the default difficulty in ~60 s of training;
-  the auto-curriculum then ratchets the opponent's tracking speed up
-  toward the target W/L of 1.5 (so the headline win-rate stays near 60 %
-  by design — watch the **difficulty plot** for the real progress curve).
-- **lander** — parallel lunar landers in constant gravity, three discrete
-  thrusters plus idle, a small landing pad at the centre of the ground.
-  Truncation, world ceiling, per-config TD clamp and a pad-width
-  curriculum are in place; with a wide-pad start (0.5× difficulty →
-  pad half-width 0.30, twice the design) the harness is set up to
-  *let* the agent learn. Reaching a positive pad-rate is the
-  prerequisite for the curriculum to engage, and at the time of writing
-  even with the wide pad the freshly-seeded policy still dies almost
-  exclusively by crash/OOB inside the first ~3 min on lavapipe — see
-  `AUDIT_PLAN.md` "still missing" for the live worklist.
+Measured on an AMD 780M integrated GPU at the shipped defaults (25
+parallel environments, one decision burst plus 8 gradient steps per
+frame), as the wall-clock time until the win rate over the last 50
+episodes first crosses the mark — see `tests/curves.rs`:
 
-Both run as separate binaries (`cargo run --release --bin pong` /
-`--bin lander`). They share the `mega-plays` library: same driver, same
-DQN agent, same overlay — only the `Game` impl differs.
+| game | milestone | reached |
+| --- | --- | --- |
+| **catch** — paddle under a falling ball | 50 % caught | **2.4 s** |
+| **pong** — against a scripted tracker | 50 % of points | **6.2 s** |
+| **lander** — soft touchdown on the pad | 20 % on-pad | **~13 s** ± |
+
+± the lander's first success is still a lottery: 3 s, 12 s, 14 s and
+15 s over four seeds, where pong and catch repeat to within a second or
+two. Once it lands once it climbs to ~90 % on-pad and stays there.
+
+For scale, the same pong milestone took ~18 s before this round of
+tuning, and the lander never reached its milestone at all — it learned
+to hover until the time limit and stayed there. What changed is
+described under [learning fast enough to
+watch](#learning-fast-enough-to-watch).
+
+All three then keep climbing — pong and catch to 90-100 %, the lander
+to ~90 % on-pad — at which point the auto-curriculum starts making the
+game harder instead, and the **difficulty plot** becomes the real
+progress curve.
+
+Each is a separate binary (`cargo run --release --bin pong` /
+`--bin lander` / `--bin catch`). They share the `mega-plays` library:
+same driver, same DQN agent, same overlay — only the `Game` impl
+differs.
 
 Each "decision" the agent makes is held for `action_repeat` physics
 substeps (default 4) — DQN's standard frame-skip trick. Cuts inference
@@ -53,10 +64,16 @@ mega-plays/
 │   ├── stats.rs            # rolling stats, sparkline
 │   ├── pong.rs             # Pong physics + rendering
 │   ├── lander.rs           # Lunar lander physics + rendering
+│   ├── catch.rs            # Catch physics + rendering
 │   ├── profiling.rs        # Perfetto trace glue (off by default)
 │   └── bin/
 │       ├── pong.rs
-│       └── lander.rs
+│       ├── lander.rs
+│       └── catch.rs
+└── tests/
+    ├── headless.rs         # CI smoke: does pong actually learn?
+    └── curves.rs           # ignored: learning curves, throughput,
+                            #   random-policy baselines
 ```
 
 Future games land as additional `src/<name>.rs` modules and
@@ -95,6 +112,54 @@ a no-window, no-render path (useful for traces on hosts that can't
 acquire a display surface — the heartbeat now prints rolling win-rate
 and loss-EMA there too).
 
+## Learning fast enough to watch
+
+The engine was never the bottleneck — a gradient step on the 33 k-param
+policy costs about a millisecond, so the driver lands ~800 of them a
+second while also running physics and drawing. What cost the demo its
+first minute was everything around it. Four changes, all measured with
+`tests/curves.rs`, which fixes a *wall-clock* budget rather than a step
+count because "does it visibly learn while you watch" is a wall-clock
+question:
+
+### n-step returns
+
+`AgentConfig::n_step` (default 3) folds three consecutive decisions into
+one replay entry: the reward is the discounted sum over them and the
+bootstrap term carries γ³ instead of γ. The network gets real reward
+from further ahead instead of trusting its own half-trained estimate for
+those steps. It is the single biggest win here — pong's 50 % milestone
+went from 7.9 s to 5.0 s, and the lander's from 17.6 s to 3.8 s — because
+both games pay out only at the end of an episode.
+
+### Schedules measured in seconds, not in steps
+
+Warmup was 5 000 transitions and ε decayed over 20 000 gradient steps.
+At the driver's rate that is five seconds of uniform-random play before
+the first gradient step and forty before the policy stops dithering —
+most of a demo, spent on flailing. Now 1 000 and 5 000: training starts
+before the window has settled and the policy is greedy inside ten
+seconds. Nothing about the algorithm changed, only the clock it is
+scheduled against.
+
+### More environments
+
+25 by default (was 9). Stepping a game is a rounding error next to a
+gradient step, one batched inference covers all of them, and each extra
+environment means more *fresh* experience per gradient step — the
+replay ratio was over 200 samples drawn per new transition, which is
+where a DQN starts memorising instead of learning. Time to pong's 50 %,
+three seeds each: 9 envs 12.5 s, 16 envs 8.6 s, 32 envs 5.7 s.
+
+### Potential-based shaping, everywhere
+
+Every game now pays out the *change* in a potential Φ rather than a
+per-step penalty (Ng et al., 1999 — a difference of potentials cannot
+reorder the optimal policy). This matters more than it sounds: the
+lander's old shaping charged distance-to-pad every substep, so a 15 s
+hover ran up about -27 against a -10 crash, and the cheapest way to stop
+losing points was to hit the ground hard.
+
 ## Design choices and departures from the original sketch
 
 ### Rendering goes through egui — no cosmic-text, no custom pipeline
@@ -120,11 +185,11 @@ queue, same memory allocator, no device-enumeration surprises.
 
 ### Vectorised environments, shared policy
 
-The driver runs `num_envs` (default 9) parallel games against a single
+The driver runs `num_envs` (default 25) parallel games against a single
 DQN. Every burst gathers observations from all environments, does **one**
-batched forward pass through the inference session, and picks 9 actions
+batched forward pass through the inference session, and picks 25 actions
 at once. The replay buffer collects transitions from all environments
-indiscriminately. Warmup fills in seconds rather than minutes.
+indiscriminately. Warmup fills in well under a second.
 
 ### Single-threaded driver (for now)
 
@@ -205,19 +270,66 @@ policy was a stable local optimum.
   of the lander's angle, angular velocity scaled to roughly [-1, 1].
 - 4 discrete actions: idle, main engine, left RCS, right RCS.
 - Physics: pure semi-implicit Euler, constant gravity, main thrust
-  along the craft's "up" axis, RCS torque. No physics library — the
-  craft is one rigid body in a horizontal-ground world, which doesn't
-  need one.
+  along the craft's "up" axis, RCS torque, and attitude damping. No
+  physics library — the craft is one rigid body in a horizontal-ground
+  world, which doesn't need one.
 - Terminal reward: `+TERMINAL_REWARD` for a soft landing on the pad
-  (upright, slow, inside ±0.15 of centre), 0 for a soft landing off
-  pad (episode still ends but it's not a "win"), `-TERMINAL_REWARD`
-  for a crash or going out of the horizontal/vertical bounds.
-- Truncation: 15 s of physics with no terminal → reset, bootstrap
+  (upright, slow, on target), `+PARTIAL_LANDING_REWARD` for a soft
+  landing off pad (episode ends, and it counts as a stepping stone but
+  not as a "win"), `-TERMINAL_REWARD` for a crash or going out of the
+  horizontal/vertical bounds.
+- Truncation: 8 s of physics with no terminal → reset, bootstrap
   survives. The hoverer is no longer a stable local optimum, and
   the overlay's "hero env" doesn't celebrate it either.
 - The lander binary sets `td_target_clamp = TERMINAL_REWARD * 1.05`
   so the ±10 sparse signal isn't compressed by the agent's default
   ±5 clamp.
+
+### Why the lander needed the *game* fixed, not the agent
+
+For a long time this game did not land, and every attempt to fix it
+from the RL side (bigger net, longer warmup, n-step) failed the same
+way: crash, crash, then hover until the time limit. `curves.rs`'s
+`random_baseline` explains why. Under uniform-random play against the
+design tolerances the craft touched down **994 times without a single
+soft landing** — 82 % of those failed the tilt *and* the speed check at
+once, at a mean vertical speed of 1.37 against a 0.40 limit. The
+positive rewards were not merely rare, they were unreachable, so
+hovering (worth 0) really was the best policy available and the agent
+was right to find it.
+
+Two changes make success reachable, and both belong to the world rather
+than the learner:
+
+- **Attitude damping** (`ANG_DAMPING`, ~0.5 s time constant). Nothing
+  used to remove angular momentum, so one RCS tap span the craft
+  forever and a random policy tumbled within a second. With damping,
+  attitude is something a policy can hold.
+- **The curriculum scales the touchdown tolerance, not just the pad
+  width.** At the starting difficulty of 0.4 the pad is wider *and* the
+  speed / tilt limits are looser, which takes the random-play success
+  rate from 0 % to about 2 % — enough to bootstrap from. The
+  auto-curriculum then tightens both back toward the design spec as the
+  pad-rate climbs, and that tightening is what the difficulty plot
+  shows.
+
+## Catch specifics
+
+- 5-float observation: paddle x, ball (x, y), ball (vx, vy).
+- 3 discrete actions: stay, left, right.
+- Reward: ±1 caught / missed, plus potential-based shaping on the
+  horizontal gap so the policy starts tracking before it has ever
+  caught anything.
+- The ball spawns at the top with a random x and sideways drift and
+  bounces off the side walls; the episode is decided the moment it
+  reaches paddle height, about a second later.
+- Difficulty scales fall speed and drift together. Catch saturates at
+  ~100 % within seconds, so in practice the auto-curriculum is what you
+  end up watching — the ball gets faster until the agent is winning
+  about 60 % of the time.
+- This is the game to launch first if you want to *see* the point of
+  the project: 25 environments resolve about 20 episodes a second, so
+  the win-rate curve moves in real time.
 
 Both rendering and physics are dependency-free beyond `glam`. The
 lander is drawn as a triangle body plus landing legs; the main engine
@@ -255,6 +367,12 @@ The training panel exposes:
   the controlled variable when curriculum is on.
 - **Difficulty over wall time** — the controlling variable, where to
   look for "we're learning" when win-rate is pinned to target.
+- **Milestones** — a timestamped list of what the agent has managed so
+  far: first win, each win-rate crossing, each difficulty step. The
+  plots say something is improving; this says *it won its first point
+  at 4 s and was winning half of them by 11 s*, which is the part a
+  viewer remembers. Also echoed to the log, so a headless run tells the
+  same story.
 
 ## Environment variables
 
@@ -263,6 +381,12 @@ The training panel exposes:
 - `MEGAPLAYS_VIEW=overlay` — start in overlay view.
 - `MEGAPLAYS_EXIT_AFTER_SECS=<n>` — self-exit after this wall time.
 - `MEGAPLAYS_FORCE_EPSILON=<f>` — pin ε to this value (for tests).
+- `MEGAPLAYS_SEED=<u64>` — seed every random stream in the process
+  (network init, ε-greedy draws, replay sampling, and each game's own
+  noise). Streams are handed out as `seed, seed+1, …` in construction
+  order, so parallel environments still differ from each other while
+  two runs of the same build compare like for like. Unset, everything
+  comes from OS entropy.
 - `MEGA_HEADLESS=<frames>` — skip window/surface/render entirely, run
   `frames` ticks of the physics+training loop, exit. Logs rolling
   win-rate and loss EMA every 500 frames.
@@ -279,20 +403,18 @@ something that converges in well under a minute on a modest laptop
 GPU, keeps the observation space flat and ≤ ~16 floats, and produces
 an on-screen policy the viewer can *see* getting better.
 
-1. **Catch / paddle-under-faller.** One paddle along the bottom, one
-   ball dropping from a random x with a sideways velocity. Reward +1
-   on catch, -1 on miss, episodes ~1 s. Easier than pong — tracking
-   without an adversary — so even a poorly-tuned network converges in
-   ~15 s and makes the harness's own behaviour easy to isolate from
-   DQN difficulty.
-2. **Grid-based find-the-food.** 8×8 grid, agent + food glyph, 4
+Catch — the previous list's first entry — shipped; it converges in
+about three seconds and is now the reference for "the harness is
+fine, the game is hard".
+
+1. **Grid-based find-the-food.** 8×8 grid, agent + food glyph, 4
    directional actions. Trivial physics, classic RL benchmark,
    benefits directly from the vectorised-env pipeline.
-3. **Flappy-pipe.** Agent with gravity + one "flap" action, pipes
+2. **Flappy-pipe.** Agent with gravity + one "flap" action, pipes
    scroll in. Episodes end on hit. Famous for being almost trivial
    with the right reward shaping and catastrophic without it — a
    good stress test for the harness's stability knobs.
-4. **Simple arena-dodger.** Agent dodges projectiles in an arena;
+3. **Simple arena-dodger.** Agent dodges projectiles in an arena;
    reward is time alive. Related in shape to pong but single-agent,
    no opponent model needed. A reasonable step toward the multi-
    agent / league-sampling variants sketched in `AUDIT_PLAN.md`.
