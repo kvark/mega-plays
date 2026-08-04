@@ -19,8 +19,13 @@ path = "src/bin/lander.rs"
 [dependencies]
 # Blade and Meganeura must use the same blade-graphics version. Both are
 # pinned by rev to avoid linking two copies of the GPU context type.
-blade-graphics = { git = "https://github.com/kvark/blade", rev = "72c30c1"}
-blade-egui = { git = "https://github.com/kvark/blade", rev = "72c30c1"}
+# Spell the rev *exactly* as meganeura's Cargo.toml spells it: Cargo keys
+# a git source on the literal rev string, so an abbreviated SHA and its
+# full form are two different sources — same commit, two crate instances,
+# and `Some(gpu)` stops type-checking with "multiple different versions
+# of crate blade_graphics in the dependency graph".
+blade-graphics = { git = "https://github.com/kvark/blade", rev = "60c2eeb8d6180ff2db5167e304d55b78a18dfee2" }
+blade-egui = { git = "https://github.com/kvark/blade", rev = "60c2eeb8d6180ff2db5167e304d55b78a18dfee2" }
 blade-macros = "0.3"
 egui = "0.34"
 egui-winit = { version = "0.34", default-features = false }
@@ -33,7 +38,7 @@ rand = "0.10"
 # spans that meganeura's profiler captures onto the Perfetto track.
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 
-meganeura = { git = "https://github.com/kvark/meganeura", rev = "cd4e172" }
+meganeura = { git = "https://github.com/kvark/meganeura", rev = "fcd34ab" }
 
 [profile.release]
 lto = "thin"

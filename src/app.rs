@@ -303,6 +303,7 @@ impl<G: Game + 'static> winit::application::ApplicationHandler for App<G> {
         let command_encoder = gpu.create_command_encoder(gpu::CommandEncoderDesc {
             name: "mega-plays",
             buffer_count: 2,
+            manual_barriers: false,
         });
 
         let egui_ctx = egui::Context::default();
