@@ -10,7 +10,7 @@ use mega_plays::{
     agent::{Agent, AgentConfig, Transition},
     env_loop::run_burst,
     game::Game,
-    pong::PongGame,
+    games::pong::PongGame,
 };
 
 /// Headless training loop: run `frames` iterations, each with

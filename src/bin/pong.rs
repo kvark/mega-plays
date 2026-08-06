@@ -1,4 +1,4 @@
-use mega_plays::{AppConfig, pong::PongGame, run};
+use mega_plays::{AppConfig, games::pong::PongGame, run};
 
 fn main() {
     run(AppConfig::default(), |_ctx| PongGame::new());

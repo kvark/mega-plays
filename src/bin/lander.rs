@@ -1,4 +1,4 @@
-use mega_plays::{AppConfig, lander, lander::LanderGame, run};
+use mega_plays::{AppConfig, games::lander, games::lander::LanderGame, run};
 
 fn main() {
     let mut cfg = AppConfig::default();

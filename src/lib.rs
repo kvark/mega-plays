@@ -28,11 +28,9 @@
 
 pub mod agent;
 pub mod app;
-pub mod catch;
 pub mod env_loop;
 pub mod game;
-pub mod lander;
-pub mod pong;
+pub mod games;
 pub mod profiling;
 pub mod stats;
 

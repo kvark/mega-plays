@@ -17,11 +17,13 @@ use std::{sync::Arc, time::Instant};
 
 use mega_plays::{
     agent::{Agent, AgentConfig, Transition},
-    catch::CatchGame,
     env_loop::run_burst,
     game::Game,
-    lander::LanderGame,
-    pong::{self, PongGame},
+    games::{
+        catch::CatchGame,
+        lander::{self, LanderGame},
+        pong::{self, PongGame},
+    },
 };
 
 fn ctx() -> Arc<blade_graphics::Context> {
@@ -272,7 +274,7 @@ fn learning_curves() {
 
     let base = if game == "lander" {
         AgentConfig {
-            td_target_clamp: mega_plays::lander::TERMINAL_REWARD * 1.05,
+            td_target_clamp: lander::TERMINAL_REWARD * 1.05,
             ..AgentConfig::default()
         }
     } else {
