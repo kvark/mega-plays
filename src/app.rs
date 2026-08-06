@@ -75,16 +75,17 @@ where
     G: Game + 'static,
     F: FnMut(Arc<gpu::Context>) -> G + 'static,
 {
-    // egglog emits one "Global `n0` should start with `$`" warning per
-    // session build, which is harmless graph-naming noise from
-    // meganeura. Silence egglog at WARN-and-below by default; user
-    // RUST_LOG still overrides. (Order matters — we set the var before
-    // env_logger reads it.)
-    if std::env::var_os("RUST_LOG").is_none() {
-        // Default: info for the rest, error for egglog.
-        unsafe { std::env::set_var("RUST_LOG", "info,egglog=error") };
-    }
-    env_logger::init();
+    // Warnings and above, like any other binary — the app's own
+    // progress lines are a debugging aid, not something to spray at
+    // everyone who launches it, and the overlay says all of it better.
+    // `RUST_LOG=mega_plays=info` turns the heartbeat and the milestone
+    // log back on. The one exception is egglog, which emits a harmless
+    // "Global `n0` should start with `$`" warning per session build
+    // from inside meganeura's graph naming; pin it a notch lower.
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("warn,egglog=error"),
+    )
+    .init();
     // Drop-guard that saves a Perfetto-compatible `.pftrace` on exit
     // (path controlled by MEGA_TRACE, default `./mega-plays.pftrace`).
     // Kept alive for the whole event loop — dropped when `run` returns.
@@ -1750,11 +1751,15 @@ fn draw_q_bars(painter: &egui::Painter, play: Rect, last_q: &[f32], hero: usize,
     }
     let q = &last_q[hero * na..(hero + 1) * na];
     let span = q.iter().fold(0.0_f32, |a, &v| a.max(v.abs())).max(1e-3);
-    let strip_h = play.height() * 0.10;
-    let strip_y = play.max.y - strip_h - 2.0;
-    let bar_w = (play.width() * 0.7) / na as f32;
+    // Tucked into the bottom-left corner rather than spread across the
+    // whole width: a full-width strip sits exactly where the lander's
+    // ground and pad are, and hides the thing the bars are commenting
+    // on.
+    let strip_h = play.height() * 0.07;
+    let strip_y = play.max.y - strip_h - 6.0;
+    let bar_w = (play.width() * 0.22) / na as f32;
+    let strip_x0 = play.min.x + 8.0;
     let strip_w = bar_w * na as f32;
-    let strip_x0 = play.center().x - strip_w * 0.5;
     let mid_y = strip_y + strip_h * 0.5;
     painter.line_segment(
         [
@@ -1851,11 +1856,11 @@ impl ViewMode {
 /// overlapping ghosts read as a softly-saturated cloud without
 /// drowning out the hero.
 fn ghost_alpha_for(n_envs: usize) -> u8 {
-    // Inverse proportional to sqrt(N) with a generous floor so
-    // ghosts stay visible even with many envs — 4 envs ≈ 120,
-    // 16 envs ≈ 60, 64 envs ≈ 40.
+    // Inverse proportional to sqrt(N) with a generous floor so ghosts
+    // stay legible against a dark backdrop even at the default 25 —
+    // 4 envs ≈ 120, 25 envs ≈ 70, 64 envs ≈ 70.
     let n = (n_envs as f32).max(1.0);
-    ((240.0 / n.sqrt()).clamp(40.0, 200.0)) as u8
+    ((240.0 / n.sqrt()).clamp(70.0, 200.0)) as u8
 }
 
 /// Win-rate levels worth announcing, and the difficulty levels the
